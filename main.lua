@@ -1,5 +1,5 @@
 -- ============================================================================
--- BOLONG-HUB v4.3.7 - VERSI SANGAT TERBACA (STATIC DEOBFUSCATION)
+-- BOLONG-HUB v4.3.7 - AUTO PARRY V3.2 HIT-RANGE - VERSI SANGAT TERBACA (STATIC DEOBFUSCATION)
 -- ============================================================================
 -- Tujuan file ini: menerjemahkan struktur dan identifier hasil obfuscation
 -- menjadi nama yang dapat dipahami manusia. Payload TIDAK dijalankan saat
@@ -6855,746 +6855,832 @@ local function BolongHub()
 
         local fn_ParryHelper_6254
         do
-            ----------------------------------------------------------------------
-            -- AUTO PARRY V3 - Adaptive Predictive Controller
-            --
-            -- Redesigned around one decision pipeline:
-            --   detect attack -> arm from animation cue -> estimate impact time
-            --   -> compensate RTT/jitter/FPS -> align facing -> parry -> verify/expire
-            --
-            -- The existing UI/state fields are retained for compatibility.
-            ----------------------------------------------------------------------
+            -- AUTO PARRY V3.1 HYBRID
+            -- Fix: preserve legacy trigger paths so adaptive prediction cannot suppress all parries.
+            -- Keep the original proven detection paths, then add adaptive
+            -- prediction/facing as an overlay. Do not let the adaptive layer
+            -- suppress the legacy parry trigger.
+            local AP_Network = { ping = 0, jitter = 0, frame = 1/60, initialized = false }
+            local AP_Target = nil
+            local AP_RotateUntil = 0
 
-            local HIDDEN_ATTACK_ID = 98163597193511
-            local HIDDEN_ATTACK_ANIMATION = "rbxassetid://" .. HIDDEN_ATTACK_ID
-
-            local MASKED_ATTACK_PROFILES = {
-                ["rbxassetid://117070354890871"] = { type = "lungehold", length = 2.00, speed = 1.00 },
-                ["rbxassetid://106871536134252"] = { type = "attack",    length = 3.00, speed = 1.00 },
-                ["rbxassetid://109402730355822"] = { type = "attack",    length = 2.95, speed = 1.00 },
-            }
-
-            local ATTACK_PROFILES = {
-                [113255068724446] = { type="lungehold", length=1.00, speed=1.00, triggerProgress=0.018, triggerTime=0.018 },
-                [74968262036854]  = { type="attack",    length=1.70, speed=1.00, triggerProgress=0.018, triggerTime=0.030 },
-                [135002183282873] = { type="lungehold", length=1.50, speed=1.00, triggerProgress=0.015, triggerTime=0.022 },
-                [121216847022485] = { type="attack",    length=1.75, speed=1.00, triggerProgress=0.015, triggerTime=0.025 },
-                [117042998468241] = { type="lungehold", length=1.00, speed=1.00, triggerProgress=0.018, triggerTime=0.018 },
-                [133963973694098] = { type="attack",    length=1.72, speed=1.00, triggerProgress=0.016, triggerTime=0.025 },
-                [110355011987939] = { type="lungehold", length=1.00, speed=1.00, triggerProgress=0.012, triggerTime=0.012 },
-                [139369275981139] = { type="attack",    length=1.72, speed=1.00, triggerProgress=0.014, triggerTime=0.022 },
-                [118907603246885] = { type="lungehold", length=0.83, speed=1.00, triggerProgress=0.010, triggerTime=0.010 },
-                [78432063483146]  = { type="attack",    length=1.72, speed=1.00, triggerProgress=0.018, triggerTime=0.025 },
-                [122812055447896] = { type="lungehold", length=0.75, speed=1.00, triggerProgress=0.010, triggerTime=0.008 },
-                [78935059863801]  = { type="attack",    length=1.63, speed=1.00, triggerProgress=0.016, triggerTime=0.022 },
-                [129784271201071] = { type="lungehold", length=1.00, speed=1.00, triggerProgress=0.015, triggerTime=0.015 },
-                [132817836308238] = { type="attack",    length=1.72, speed=1.00, triggerProgress=0.017, triggerTime=0.025 },
-                [105374834496520] = { type="lungehold", length=1.00, speed=1.00, triggerProgress=0.010, triggerTime=0.010 },
-                [111920872708571] = { type="attack",    length=1.72, speed=1.00, triggerProgress=0.014, triggerTime=0.022 },
-            }
-
-            local ATTACK_PROFILE_BY_ID = {}
-            for id, profile in pairs(ATTACK_PROFILES) do
-                ATTACK_PROFILE_BY_ID["rbxassetid://" .. id] = profile
-            end
-
-            local AP = {
-                attacks = {},
-                lastParry = -math.huge,
-                nextDebug = 0,
-                currentTarget = nil,
-                autorotateBackup = nil,
-                autorotateCharacter = nil,
-                smoothedPing = 0,
-                jitter = 0,
-                frameTime = 1 / 60,
-                initializedNetwork = false,
-                predictionError = 0,
-                predictionErrorSamples = 0,
-            }
-
-            local function AP_Now()
-                return os.clock()
-            end
-
-            local function AP_GetRoot(character)
-                return character and character:FindFirstChild("HumanoidRootPart") or nil
-            end
-
-            local function AP_GetHumanoid(character)
-                return character and character:FindFirstChildOfClass("Humanoid") or nil
-            end
-
-            local function AP_Horizontal(vector)
-                return Vector3.new(vector.X, 0, vector.Z)
-            end
-
-            local function AP_GetNetworkProfile(dt)
-                local frame = math.clamp(tonumber(dt) or (1 / 60), 1 / 240, 0.10)
-                AP.frameTime = AP.frameTime * 0.90 + frame * 0.10
-
-                local rawPing = 0
-                pcall(function()
-                    rawPing = tonumber(LocalPlayer:GetNetworkPing()) or 0
-                end)
-                rawPing = math.clamp(rawPing, 0, 0.50)
-
-                if not AP.initializedNetwork then
-                    AP.smoothedPing = rawPing
-                    AP.jitter = 0
-                    AP.initializedNetwork = true
+            local function AP_UpdateNetwork(dt)
+                local frame = math.clamp(tonumber(dt) or 1/60, 1/240, 0.1)
+                AP_Network.frame = AP_Network.frame * 0.9 + frame * 0.1
+                local ping = 0
+                pcall(function() ping = tonumber(LocalPlayer:GetNetworkPing()) or 0 end)
+                ping = math.clamp(ping, 0, 0.5)
+                if not AP_Network.initialized then
+                    AP_Network.ping = ping
+                    AP_Network.jitter = 0
+                    AP_Network.initialized = true
                 else
-                    local delta = math.abs(rawPing - AP.smoothedPing)
-                    AP.smoothedPing = AP.smoothedPing * 0.88 + rawPing * 0.12
-                    AP.jitter = AP.jitter * 0.85 + delta * 0.15
+                    local d = math.abs(ping - AP_Network.ping)
+                    AP_Network.ping = AP_Network.ping * 0.88 + ping * 0.12
+                    AP_Network.jitter = AP_Network.jitter * 0.85 + d * 0.15
                 end
-
-                return AP.smoothedPing, AP.jitter, AP.frameTime
             end
 
-            local function AP_GetLatencyLead()
-                local ping = AP.smoothedPing
-                local jitter = AP.jitter
-                local frame = AP.frameTime
-
+            local function AP_GetLead()
                 if State.autoParryAdaptiveLatency == false then
-                    return math.clamp(0.045 + frame * 0.5, 0.035, 0.075)
+                    return math.clamp(0.045 + AP_Network.frame * 0.5, 0.035, 0.075)
+                end
+                -- Conservative preparation lead. It is used for facing and
+                -- prediction only; it does NOT replace the legacy parry trigger.
+                local lead = AP_Network.ping * 0.60
+                    + AP_Network.jitter * 0.90
+                    + AP_Network.frame * 0.75
+                    + 0.012
+                return math.clamp(lead, 0.030, 0.16)
+            end
+
+            local function AP_FaceKiller(character, extraLead)
+                if State.autoParryAutoFace == false or not character then return end
+                local localChar = LocalPlayer.Character
+                local localRoot = localChar and localChar:FindFirstChild("HumanoidRootPart")
+                local killerRoot = character:FindFirstChild("HumanoidRootPart")
+                if not localRoot or not killerRoot then return end
+
+                local predictionTime = math.clamp(tonumber(extraLead) or AP_GetLead(), 0, 0.20)
+                local velocity = killerRoot.AssemblyLinearVelocity
+                local targetPos = killerRoot.Position + Vector3.new(velocity.X * predictionTime, 0, velocity.Z * predictionTime)
+                local horizontal = Vector3.new(targetPos.X, localRoot.Position.Y, targetPos.Z) - localRoot.Position
+                if horizontal.Magnitude <= 0.05 then return end
+
+                local desired = CFrame.lookAt(localRoot.Position, localRoot.Position + horizontal.Unit)
+                local strict = math.clamp(tonumber(State.aimStrictness) or 0.5, 0, 1)
+                local alpha = math.clamp(0.30 + strict * 0.20 + AP_Network.frame * 6, 0.28, 0.60)
+
+                local humanoid = localChar:FindFirstChildOfClass("Humanoid")
+                local oldAutoRotate = humanoid and humanoid.AutoRotate
+                if humanoid then
+                    AP_RotateUntil = math.max(AP_RotateUntil, os.clock() + 0.16)
+                    humanoid.AutoRotate = false
                 end
 
-                -- RTT is treated as round-trip network delay; half of it is used
-                -- as the baseline client->server timing component. Jitter and
-                -- local frame time add uncertainty buffers.
-                local baseline = ping * 0.50
-                local jitterLead = jitter * 0.85
-                local frameLead = frame * 0.60
-                local safety = 0.012 + math.clamp(jitter * 0.35, 0, 0.025)
+                local targetCF = CFrame.new(localRoot.Position) * desired.Rotation
+                pcall(function() localRoot.CFrame = localRoot.CFrame:Lerp(targetCF, alpha) end)
 
-                return math.clamp(baseline + jitterLead + frameLead + safety, 0.025, 0.18)
-            end
-
-            local function AP_GetFacingLimit()
-                local strictness = math.clamp(tonumber(State.aimStrictness) or 0.5, 0, 1)
-                -- 48° at zero strictness -> 24° at max strictness.
-                return math.rad(48 - strictness * 24)
-            end
-
-            local function AP_IsFacing(targetPosition, playerRoot, toleranceOverride)
-                if not playerRoot then return false, 0, math.huge end
-                local direction = AP_Horizontal(targetPosition - playerRoot.Position)
-                if direction.Magnitude <= 0.001 then return true, 1, 0 end
-                direction = direction.Unit
-
-                local forward = AP_Horizontal(playerRoot.CFrame.LookVector)
-                if forward.Magnitude <= 0.001 then return false, -1, math.huge end
-                forward = forward.Unit
-
-                local dot = math.clamp(forward:Dot(direction), -1, 1)
-                local angle = math.acos(dot)
-                local limit = toleranceOverride or AP_GetFacingLimit()
-                return angle <= limit, dot, angle
-            end
-
-            local function AP_FaceTarget(targetPosition, playerRoot, dt)
-                if State.autoParryAutoFace == false or not playerRoot then
-                    return
-                end
-
-                local horizontalTarget = Vector3.new(targetPosition.X, playerRoot.Position.Y, targetPosition.Z)
-                local offset = horizontalTarget - playerRoot.Position
-                if offset.Magnitude <= 0.05 then return end
-
-                local desired = CFrame.lookAt(playerRoot.Position, horizontalTarget)
-                local alpha = math.clamp((tonumber(dt) or (1 / 60)) * 24, 0.12, 0.72)
-                local targetCFrame = CFrame.new(playerRoot.Position) * desired.Rotation
-                playerRoot.CFrame = playerRoot.CFrame:Lerp(targetCFrame, alpha)
-            end
-
-            local function AP_SetAutoRotate(enabled)
-                local character = LocalPlayer.Character
-                local humanoid = AP_GetHumanoid(character)
-                if not humanoid then return end
-
-                if enabled then
-                    if AP.autorotateCharacter == character and AP.autorotateBackup ~= nil then
-                        pcall(function() humanoid.AutoRotate = AP.autorotateBackup end)
-                    end
-                    AP.autorotateBackup = nil
-                    AP.autorotateCharacter = nil
-                else
-                    if AP.autorotateCharacter ~= character then
-                        AP.autorotateBackup = humanoid.AutoRotate
-                        AP.autorotateCharacter = character
-                    end
-                    pcall(function() humanoid.AutoRotate = false end)
-                end
-            end
-
-            local function AP_LineOfSight(killerCharacter, playerRoot)
-                if not killerCharacter or not playerRoot then return false end
-                local killerRoot = AP_GetRoot(killerCharacter)
-                if not killerRoot then return false end
-
-                local origin = playerRoot.Position
-                local target = killerRoot.Position
-                local direction = target - origin
-                if direction.Magnitude <= 0.05 then return true end
-
-                local params = RaycastParams.new()
-                params.FilterType = Enum.RaycastFilterType.Exclude
-                params.FilterDescendantsInstances = { LocalPlayer.Character, killerCharacter }
-                params.IgnoreWater = true
-
-                local offsets = {
-                    Vector3.new(0, 0, 0),
-                    Vector3.new(0, 1.10, 0),
-                    Vector3.new(0, -0.75, 0),
-                    Vector3.new(0.55, 0.35, 0),
-                }
-
-                local clear = 0
-                local specialSurface = false
-                for _, offset in ipairs(offsets) do
-                    local result = workspace:Raycast(origin + offset, direction, params)
-                    if not result then
-                        clear += 1
-                    else
-                        local name = tostring(result.Instance and result.Instance.Name or ""):lower()
-                        if name:find("vault") or name:find("window") or name:find("ledge") then
-                            specialSurface = true
+                if humanoid and oldAutoRotate ~= nil then
+                    task.delay(0.20, function()
+                        if humanoid.Parent and os.clock() >= AP_RotateUntil then
+                            pcall(function() humanoid.AutoRotate = oldAutoRotate end)
                         end
+                    end)
+                end
+            end
+
+            local var_rootPart_4020=98163597193511
+            local var_animationId_c5ef="rbxassetid://"..var_rootPart_4020
+            local var_buffer_3f09=30
+            local var_buffer_ba0d=13.8
+            local var_buffer_706c=0.08
+            local var_buffer_17b3={
+                ["rbxassetid://117070354890871"]={type="lungehold",length=2.00,speed=1.00},
+                [(function() if var_section_a5d6 and buffer then local _bf=buffer.create(28) local _by={114,98,120,97,115,115,101,116,105,100,58,47,47,49,48,54,56,55,49,53,51,54,49,51,52,50,53,52} for _i=1,#_by do buffer.writeu8(_bf,_i-1,_by[_i]) end local _s={} for _i=1,#_by do _s[_i]=string.char(buffer.readu8(_bf,_i-1)) end return table.concat(_s) else local _by={114,98,120,97,115,115,101,116,105,100,58,47,47,49,48,54,56,55,49,53,51,54,49,51,52,50,53,52} local _s={} for _i=1,#_by do _s[_i]=string.char(_by[_i]) end return table.concat(_s) end end)()]={type="attack",length=3.00,speed=1.00},
+                ["rbxassetid://109402730355822"]={type="attack",length=2.95,speed=1.00}
+            }
+            local var_originalValue_33aa=4.5
+            local var_vector_725f=2.75
+            local var_originalValue_b2ae=(2.0)
+            local var_originalValue_1f11=0.18
+            local var_originalValue_49fc=2.25
+            local var_selectedKiller_de8a={
+                [113255068724446]={type="lungehold",length=1.00,speed=1.00,triggerProgress=0.018,triggerTime=0.018},
+                [74968262036854]={type="attack",length=1.70,speed=1.00,triggerProgress=0.018,triggerTime=0.030},
+                [135002183282873]={type="lungehold",length=1.50,speed=1.00,triggerProgress=0.015,triggerTime=0.022},
+                [121216847022485]={type="attack",length=1.75,speed=1.00,triggerProgress=0.015,triggerTime=0.025},
+                [117042998468241]={type="lungehold",length=1.00,speed=1.00,triggerProgress=0.018,triggerTime=0.018},
+                [133963973694098]={type="attack",length=1.72,speed=1.00,triggerProgress=0.016,triggerTime=0.025},
+                [110355011987939]={type="lungehold",length=1.00,speed=1.00,triggerProgress=0.012,triggerTime=0.012},
+                [139369275981139]={type="attack",length=1.72,speed=1.00,triggerProgress=0.014,triggerTime=0.022},
+                [118907603246885]={type="lungehold",length=0.83,speed=1.00,triggerProgress=0.010,triggerTime=0.010},
+                [78432063483146]={type="attack",length=1.72,speed=1.00,triggerProgress=0.018,triggerTime=0.025},
+                [122812055447896]={type="lungehold",length=0.75,speed=1.00,triggerProgress=0.010,triggerTime=0.008},
+                [78935059863801]={type="attack",length=1.63,speed=1.00,triggerProgress=0.016,triggerTime=0.022},
+                [129784271201071]={type="lungehold",length=1.00,speed=1.00,triggerProgress=0.015,triggerTime=0.015},
+                [132817836308238]={type="attack",length=1.72,speed=1.00,triggerProgress=0.017,triggerTime=0.025},
+                [105374834496520]={type="lungehold",length=1.00,speed=1.00,triggerProgress=0.010,triggerTime=0.010},
+                [111920872708571]={type="attack",length=1.72,speed=1.00,triggerProgress=0.014,triggerTime=0.022}
+            }
+            local var_selectedKiller_7096={}
+            for id,profile in pairs(var_selectedKiller_de8a) do
+                var_selectedKiller_7096["rbxassetid://"..id]=profile
+            end
+            local function fn_ParryHelper_ed9e(player,char)
+                if not player or not char then return nil end
+                if player==LocalPlayer then
+                    local var_attributeValue_a33a=LocalPlayer.GetAttribute(LocalPlayer,"SelectedKiller")
+                    if var_attributeValue_a33a then return var_attributeValue_a33a end
+                end
+                local var_success_abb9,values=pcall(function() return char.WaitForChild(char,"Values",2) end)
+                if var_success_abb9 and values then
+                    local var_selectedKiller_6a75=values.FindFirstChild(values,"KillerName")
+                    if var_selectedKiller_6a75 and var_selectedKiller_6a75.IsA(var_selectedKiller_6a75,"StringValue") then return var_selectedKiller_6a75.Value end
+                end
+                local var_attributeValue_a33a=player.GetAttribute(player,"SelectedKiller")
+                if var_attributeValue_a33a then return var_attributeValue_a33a end
+                return nil
+            end
+            local function fn_ParryHelper_eabc()
+                local char=LocalPlayer.Character
+                if not char then return end
+                if AP_Target then
+                    AP_FaceKiller(AP_Target, AP_GetLead())
+                end
+                local var_button_f05c=PlayerGui.FindFirstChild(PlayerGui,"Survivor-mob")
+                local var_descendant_180a=var_button_f05c and var_button_f05c.FindFirstChild(var_button_f05c,"Controls")
+                local var_connection_a646=var_descendant_180a and var_descendant_180a.FindFirstChild(var_descendant_180a,"Gui-mob")
+                if var_connection_a646 and var_connection_a646.IsA(var_connection_a646,"ImageButton") then
+                    firesignal(var_connection_a646.MouseButton1Down)
+                    task.defer(function()
+                        if var_connection_a646 and var_connection_a646.Parent then firesignal(var_connection_a646.MouseButton1Up) end
+                    end)
+                else
+                    local var_success_abb9,fakeInput=pcall(function()
+                        local var_instance_5397=Instance.new("InputObject")
+                        var_instance_5397.UserInputType=Enum.UserInputType.MouseButton2
+                        var_instance_5397.UserInputState=Enum.UserInputState.Begin
+                        return var_instance_5397
+                    end)
+                    if var_success_abb9 and fakeInput then
+                        for _,var_connection_90bd in getconnections(UserInputService.InputBegan) do
+                            var_connection_90bd.Fire(var_connection_90bd,fakeInput,false)
+                        end
+                    else
+                        VirtualInputManager.SendMouseButtonEvent(VirtualInputManager,0,0,1,true,game,0)
                     end
                 end
+                local var_rootPart_186c=char.FindFirstChild(char,"HumanoidRootPart")
+                if var_rootPart_186c then
+                    pcall(function()
+                        if CollectionService.HasTag(CollectionService,var_rootPart_186c,"doing action") then
+                            CollectionService.RemoveTag(CollectionService,var_rootPart_186c,"doing action")
+                        end
+                    end)
+                end
+            end
+            -- ==================================================================
+            -- AUTO PARRY V3.2
+            -- IMPORTANT DESIGN CHANGE:
+            -- State.parryRadius is ONLY a detection/ESP radius. It is NEVER a
+            -- condition that directly authorizes a parry.
+            -- The actual parry gate is based on the killer's estimated hit range.
+            -- ==================================================================
 
-                if clear >= 1 then return true end
-                return specialSurface
+            local AP_NORMAL_HIT_RANGE = 4.50
+            local AP_LUNGE_HIT_RANGE = 3.50
+            local AP_MAX_LATENCY_EXTENSION = 1.25
+            local AP_FACE_PREP_MIN = 0.80
+            local AP_FACE_PREP_MAX = 2.25
+
+            local function AP_GetAttackState(targetCharacter)
+                if not targetCharacter then return nil end
+                return State.state_unhookYourself_bfd8[targetCharacter]
+                    or State.state_unhookYourself_c84b[targetCharacter]
+                    or State.state_unhookYourself_d58e[targetCharacter]
             end
 
-            local function AP_GetReach(profile)
-                if not profile then return 3.5 end
-                if profile.type == "lungehold" then return 4.25 end
-                return 3.25
+            local function AP_GetHitRange(targetCharacter, attackState)
+                local state = attackState or AP_GetAttackState(targetCharacter)
+                local profile = state and state.profile
+                if profile and profile.type == "lungehold" then
+                    return AP_LUNGE_HIT_RANGE
+                end
+                return AP_NORMAL_HIT_RANGE
             end
 
-            local function AP_IsTrackArmed(attack)
-                local track = attack.track
-                local profile = attack.profile
-                if not track or not profile then return true end
-
-                local speed = math.max(tonumber(profile.speed) or 1, 0.05)
-                local length = tonumber(track.Length)
-                if not length or length <= 0 then
-                    length = tonumber(profile.length) or 1
-                end
-
-                local timePosition = tonumber(track.TimePosition) or 0
-                local progress = math.clamp(timePosition / math.max(length / speed, 0.001), 0, 1)
-                local triggerTime = (tonumber(profile.triggerTime) or 0) / speed
-                local triggerProgress = tonumber(profile.triggerProgress) or 0
-
-                local armed = timePosition >= triggerTime or progress >= triggerProgress
-                local timeUntilTrigger = math.max(0, triggerTime - timePosition)
-                if progress < triggerProgress then
-                    timeUntilTrigger = math.max(timeUntilTrigger, (triggerProgress - progress) * (length / speed))
-                end
-                return armed, timeUntilTrigger
+            local function AP_GetHorizontalDistance(playerRoot, killerRoot)
+                if not playerRoot or not killerRoot then return math.huge end
+                local delta = playerRoot.Position - killerRoot.Position
+                return Vector3.new(delta.X, 0, delta.Z).Magnitude
             end
 
-            local function AP_ImpactEstimate(attack, playerRoot, killerRoot)
-                if not attack or not playerRoot or not killerRoot then return nil end
-
-                local playerPos = playerRoot.Position
-                local killerPos = killerRoot.Position
-                local offset = AP_Horizontal(playerPos - killerPos)
-                local distance = offset.Magnitude
-                local playerVel = AP_Horizontal(playerRoot.AssemblyLinearVelocity)
-                local killerVel = AP_Horizontal(killerRoot.AssemblyLinearVelocity)
-                local relativeVel = killerVel - playerVel
-
-                local reach = AP_GetReach(attack.profile)
-                local closingSpeed = 0
-                if distance > 0.001 then
-                    closingSpeed = math.max(0, relativeVel:Dot(offset.Unit))
-                end
-
-                local geometricEta
-                if distance <= reach + 0.55 then
-                    geometricEta = 0.045
-                elseif closingSpeed > 0.10 then
-                    geometricEta = math.clamp((distance - reach) / closingSpeed, 0.045, 1.50)
-                else
-                    return nil
-                end
-
-                local armed, timeUntilTrigger = AP_IsTrackArmed(attack)
-                local eta = math.max(geometricEta, timeUntilTrigger or 0)
-
-                -- Cap prediction to avoid projecting a fast-moving player far into
-                -- the future. Network compensation is applied separately.
-                local predictedTime = math.clamp(eta, 0, 0.80)
-                local predictedKillerPos = killerPos + killerVel * predictedTime
-                local predictedPlayerPos = playerPos + playerVel * predictedTime
-                local predictedOffset = AP_Horizontal(predictedPlayerPos - predictedKillerPos)
-                local predictedDistance = predictedOffset.Magnitude
-
-                if predictedDistance > attack.radiusGate then
-                    return nil
-                end
-
-                return {
-                    eta = eta,
-                    geometricEta = geometricEta,
-                    triggerWait = timeUntilTrigger or 0,
-                    armed = armed,
-                    distance = distance,
-                    predictedDistance = predictedDistance,
-                    closingSpeed = closingSpeed,
-                    predictedKillerPosition = predictedKillerPos,
-                    predictedPlayerPosition = predictedPlayerPos,
-                    reach = reach,
-                }
+            local function AP_GetClosingSpeed(playerRoot, killerRoot)
+                if not playerRoot or not killerRoot then return 0 end
+                local offset = playerRoot.Position - killerRoot.Position
+                local horizontal = Vector3.new(offset.X, 0, offset.Z)
+                if horizontal.Magnitude <= 0.001 then return 0 end
+                local killerVelocity = killerRoot.AssemblyLinearVelocity
+                local playerVelocity = playerRoot.AssemblyLinearVelocity
+                local relative = Vector3.new(
+                    killerVelocity.X - playerVelocity.X,
+                    0,
+                    killerVelocity.Z - playerVelocity.Z
+                )
+                return math.max(0, relative:Dot(horizontal.Unit))
             end
 
-            local function AP_ShouldParry(attack, estimate, playerRoot)
-                if not attack or not estimate or not playerRoot then return false end
-                if not estimate.armed then return false end
+            local function AP_IsInsideHitEnvelope(targetCharacter, attackState)
+                if not targetCharacter then return false, math.huge, 0, 0 end
+                local playerChar = LocalPlayer.Character
+                local playerRoot = playerChar and playerChar:FindFirstChild("HumanoidRootPart")
+                local killerRoot = targetCharacter:FindFirstChild("HumanoidRootPart")
+                if not playerRoot or not killerRoot then return false, math.huge, 0, 0 end
 
-                local latencyLead = AP_GetLatencyLead()
-                local parryWindow = math.max(0.015, latencyLead)
+                local hitRange = AP_GetHitRange(targetCharacter, attackState)
+                local distance = AP_GetHorizontalDistance(playerRoot, killerRoot)
+                local closingSpeed = AP_GetClosingSpeed(playerRoot, killerRoot)
 
-                if estimate.eta > parryWindow then
-                    return false
+                -- The normal condition is CURRENT physical hit range.
+                if distance <= hitRange then
+                    return true, distance, hitRange, closingSpeed
                 end
 
-                if estimate.distance > State.parryRadius + 1.5 then
-                    return false
+                -- Small latency extension is allowed only when the killer is
+                -- actively closing on the player. This is derived from the
+                -- physical hit range, NOT from State.parryRadius.
+                local lead = AP_GetLead()
+                local latencyExtension = math.clamp(closingSpeed * lead, 0, AP_MAX_LATENCY_EXTENSION)
+                local effectiveRange = hitRange + latencyExtension
+
+                if closingSpeed > 0 and distance <= effectiveRange then
+                    return true, distance, hitRange, closingSpeed
                 end
 
-                if not AP_LineOfSight(attack.character, playerRoot) then
-                    return false
-                end
-
-                local facingOk = AP_IsFacing(estimate.predictedKillerPosition, playerRoot)
-                if State.autoParryAutoFace == false and not facingOk then
-                    return false
-                end
-
-                return true
+                return false, distance, hitRange, closingSpeed
             end
 
-            local function AP_DoParry()
+            local function AP_ShouldStartFacing(targetCharacter, attackState)
+                local playerChar = LocalPlayer.Character
+                local playerRoot = playerChar and playerChar:FindFirstChild("HumanoidRootPart")
+                local killerRoot = targetCharacter and targetCharacter:FindFirstChild("HumanoidRootPart")
+                if not playerRoot or not killerRoot then return false end
+
+                local distance = AP_GetHorizontalDistance(playerRoot, killerRoot)
+                local hitRange = AP_GetHitRange(targetCharacter, attackState)
+                local closingSpeed = AP_GetClosingSpeed(playerRoot, killerRoot)
+                local lead = AP_GetLead()
+                local prep = math.clamp(
+                    AP_FACE_PREP_MIN + closingSpeed * lead,
+                    AP_FACE_PREP_MIN,
+                    AP_FACE_PREP_MAX
+                )
+                return distance <= hitRange + prep
+            end
+
+            local function fn_ParryHelper_e2ea(force,targetCharacter,reportedDistance)
                 if not State.autoParryEnabled then return false end
-                local now = AP_Now()
-                if now - AP.lastParry < 0.045 then return false end
-                AP.lastParry = now
+                AP_Target = targetCharacter
 
-                local character = LocalPlayer.Character
-                if not character then return false end
+                local attackState = AP_GetAttackState(targetCharacter)
+                local inHitEnvelope, actualDistance, hitRange, closingSpeed =
+                    AP_IsInsideHitEnvelope(targetCharacter, attackState)
 
-                local button = PlayerGui:FindFirstChild("Survivor-mob")
-                local controls = button and button:FindFirstChild("Controls")
-                local parryButton = controls and controls:FindFirstChild("Gui-mob")
-
-                if parryButton and parryButton:IsA("ImageButton") then
-                    pcall(function()
-                        firesignal(parryButton.MouseButton1Down)
-                        task.defer(function()
-                            if parryButton.Parent then
-                                firesignal(parryButton.MouseButton1Up)
-                            end
-                        end)
-                    end)
-                else
-                    local ok, fakeInput = pcall(function()
-                        local input = Instance.new("InputObject")
-                        input.UserInputType = Enum.UserInputType.MouseButton2
-                        input.UserInputState = Enum.UserInputState.Begin
-                        return input
-                    end)
-                    if ok and fakeInput then
-                        pcall(function()
-                            for _, connection in getconnections(UserInputService.InputBegan) do
-                                connection:Fire(fakeInput, false)
-                            end
-                        end)
-                    else
-                        pcall(function()
-                            VirtualInputManager:SendMouseButtonEvent(0, 0, 1, true, game, 0)
-                            task.defer(function()
-                                pcall(function()
-                                    VirtualInputManager:SendMouseButtonEvent(0, 0, 1, false, game, 0)
-                                end)
-                            end)
-                        end)
-                    end
+                -- This is the critical gate. A killer being inside the user's
+                -- red detection circle does not authorize a parry.
+                if not inHitEnvelope then
+                    return false
                 end
 
-                local root = AP_GetRoot(character)
-                if root then
-                    pcall(function()
-                        if CollectionService:HasTag(root, "doing action") then
-                            CollectionService:RemoveTag(root, "doing action")
+                if AP_ShouldStartFacing(targetCharacter, attackState) then
+                    AP_FaceKiller(targetCharacter, AP_GetLead())
+                end
+
+                local now = tick()
+                if now - State.var_originalValue_a386 < 0.01 then return false end
+
+                local function HasLineOfSight()
+                    local playerChar = LocalPlayer.Character
+                    local playerRoot = playerChar and playerChar:FindFirstChild("HumanoidRootPart")
+                    local killerRoot = targetCharacter and targetCharacter:FindFirstChild("HumanoidRootPart")
+                    if not playerRoot or not killerRoot then return false end
+
+                    local origin = playerRoot.Position
+                    local target = killerRoot.Position
+                    local direction = target - origin
+                    if direction.Magnitude <= 0.05 then return true end
+
+                    local params = RaycastParams.new()
+                    params.FilterType = Enum.RaycastFilterType.Exclude
+                    params.FilterDescendantsInstances = {playerChar, targetCharacter}
+                    params.IgnoreWater = true
+
+                    local offsets = {
+                        Vector3.new(0, 0, 0),
+                        Vector3.new(0, 1.1, 0),
+                        Vector3.new(0, -0.75, 0),
+                    }
+                    for _, offset in ipairs(offsets) do
+                        local hit = workspace:Raycast(origin + offset, direction, params)
+                        if not hit then return true end
+                        local name = tostring(hit.Instance and hit.Instance.Name or ""):lower()
+                        local profile = attackState and attackState.profile
+                        if profile and profile.type == "lungehold" and
+                            (name:find("vault",1,true) or name:find("window",1,true) or name:find("ledge",1,true)) then
+                            return true
                         end
-                    end)
+                    end
+                    return false
                 end
+
+                if not HasLineOfSight() then return false end
+
+                State.var_originalValue_a386 = now
+                if State.autoParryDebug then
+                    local lead = AP_GetLead()
+                    Notify(
+                        "Auto Parry",
+                        string.format(
+                            "PARRY | Dist %.2f | Hit %.2f | Close %.2f | Lead %.0fms | Ping %.0fms",
+                            actualDistance,
+                            hitRange,
+                            closingSpeed,
+                            lead * 1000,
+                            AP_Network.ping * 1000
+                        ),
+                        0.15
+                    )
+                end
+
+                fn_ParryHelper_eabc()
                 return true
             end
 
-            local function AP_ClearAttack(character)
-                if not character then return end
-                AP.attacks[character] = nil
-            end
+            local function fn_ParryHelper_8596(targetCharacter)
+                if not State.autoParryEnabled then return false end
+                if targetCharacter then AP_Target = targetCharacter end
+                local target = targetCharacter or AP_Target
+                if not target then return false end
 
-            local function AP_RegisterAttack(character, player, track, profile, attackType)
-                if not character or not track then return end
-                local attack = {
-                    character = character,
-                    player = player,
-                    track = track,
-                    profile = profile,
-                    type = attackType or (profile and profile.type) or "attack",
-                    started = AP_Now(),
-                    fired = false,
-                    radiusGate = math.max(State.parryRadius + 4, 16),
-                    lastPredictedPosition = nil,
-                }
-                AP.attacks[character] = attack
-
-                local connection
-                connection = track.Stopped:Connect(function()
-                    if connection then connection:Disconnect() end
-                    if AP.attacks[character] and AP.attacks[character].track == track then
-                        AP.attacks[character] = nil
-                    end
-                end)
-                attack.connection = connection
-            end
-
-            local function AP_HookKillerCharacter(player, character)
-                if player == LocalPlayer or not character then return end
-                task.spawn(function()
-                    task.wait(0.15)
-                    if not character.Parent then return end
-
-                    local killerName = nil
-                    pcall(function()
-                        local values = character:FindFirstChild("Values")
-                        local killerNameValue = values and values:FindFirstChild("KillerName")
-                        if killerNameValue and killerNameValue:IsA("StringValue") then
-                            killerName = killerNameValue.Value
-                        end
-                    end)
-                    killerName = killerName or player:GetAttribute("SelectedKiller")
-                    if not killerName and player.Team then
-                        local team = player.Team.Name:lower()
-                        if team:find("killer") then killerName = "Unknown Killer" end
-                    end
-                    if not killerName then return end
-
-                    State.killerCharacters[character] = { player = player, name = killerName }
-
-                    character.AncestryChanged:Connect(function(_, parent)
-                        if not parent then
-                            State.killerCharacters[character] = nil
-                            AP_ClearAttack(character)
-                            State.state_unhookYourself_bfd8[character] = nil
-                            State.state_unhookYourself_d58e[character] = nil
-                            State.state_unhookYourself_c84b[character] = nil
-                        end
-                    end)
-
-                    local humanoid = character:WaitForChild("Humanoid", 3)
-                    local animator = humanoid and (humanoid:FindFirstChildOfClass("Animator") or humanoid)
-                    if not animator then return end
-
-                    animator.AnimationPlayed:Connect(function(track)
-                        if not State.autoParryEnabled then return end
-                        if not track or not track.Animation then return end
-
-                        local animationId = track.Animation.AnimationId
-                        if animationId == HIDDEN_ATTACK_ANIMATION and tostring(killerName):lower() == "the hidden" then
-                            AP_RegisterAttack(character, player, track, {
-                                type = "attack",
-                                length = 1.0,
-                                speed = 1.0,
-                                triggerProgress = 0.01,
-                                triggerTime = 0.015,
-                            }, "hidden")
-                            return
-                        end
-
-                        if tostring(killerName):lower():find("the masked") then
-                            local maskedProfile = MASKED_ATTACK_PROFILES[animationId]
-                            if maskedProfile then
-                                AP_RegisterAttack(character, player, track, maskedProfile, "maskedfast")
-                                return
-                            end
-                        end
-
-                        local profile = ATTACK_PROFILE_BY_ID[animationId]
-                        if not profile then return end
-                        AP_RegisterAttack(character, player, track, profile, profile.type)
-                    end)
-                end)
-            end
-
-            local function AP_HookAllPlayers()
-                for _, player in ipairs(Players:GetPlayers()) do
-                    if player ~= LocalPlayer then
-                        if player.Character then
-                            AP_HookKillerCharacter(player, player.Character)
-                        end
-                        player.CharacterAdded:Connect(function(character)
-                            AP_HookKillerCharacter(player, character)
-                        end)
-                    end
+                local attackState = AP_GetAttackState(target)
+                local inHitEnvelope, actualDistance, hitRange, closingSpeed =
+                    AP_IsInsideHitEnvelope(target, attackState)
+                if not inHitEnvelope then
+                    return false
                 end
 
-                Players.PlayerAdded:Connect(function(player)
-                    if player == LocalPlayer then return end
-                    player.CharacterAdded:Connect(function(character)
-                        AP_HookKillerCharacter(player, character)
-                    end)
-                    if player.Character then
-                        AP_HookKillerCharacter(player, player.Character)
-                    end
-                end)
+                if AP_ShouldStartFacing(target, attackState) then
+                    AP_FaceKiller(target, AP_GetLead())
+                end
+
+                local now = tick()
+                if now - State.var_originalValue_b002 < 0.003 then return false end
+                State.var_originalValue_b002 = now
+                fn_ParryHelper_eabc()
+                return true
             end
-
-            AP_HookAllPlayers()
-
-            RunService.Heartbeat:Connect(function(dt)
-                if not State.autoParryEnabled then
-                    if AP.currentTarget then
-                        AP_SetAutoRotate(true)
-                        AP.currentTarget = nil
+            local function fn_ParryHelper_a725(var_rootPart_1fbd)
+                if typeof(var_rootPart_1fbd)~="string" then return false end
+                local name=var_rootPart_1fbd.lower(var_rootPart_1fbd)
+                return name=="the masked (duck)" or name=="the masked"
+            end
+            local function fn_ParryHandler_cf19(char)
+                local var_rootPart_f536=LocalPlayer.Character
+                local var_rootPart_f542=var_rootPart_f536 and var_rootPart_f536.FindFirstChild(var_rootPart_f536,"HumanoidRootPart")
+                local var_rootPart_7d5e=char and char.FindFirstChild(char,"HumanoidRootPart")
+                if not var_rootPart_f542 or not var_rootPart_7d5e then return math.huge end
+                local var_rootPart_4e4c=var_rootPart_f542.Position
+                local var_rootPart_b34c=var_rootPart_7d5e.Position
+                return (Vector3.new(var_rootPart_4e4c.X,(0.0),var_rootPart_4e4c.Z)-Vector3.new(var_rootPart_b34c.X,0,var_rootPart_b34c.Z)).Magnitude
+            end
+            local function fn_ParryHelper_285e(char,var_vector_6d30)
+                if var_vector_6d30.var_rootPart_816b or not State.autoParryEnabled then return false end
+                AP_Target = char
+                if var_vector_6d30.name.lower(var_vector_6d30.name)~="the hidden" then return false end
+                local var_rootPart_507f=fn_ParryHandler_cf19(char)
+                if var_rootPart_507f<=var_buffer_3f09 then
+                    if fn_ParryHelper_8596(char) then
+                        var_vector_6d30.var_rootPart_816b=true
+                        return true
                     end
-                    return
                 end
-
-                local playerCharacter = LocalPlayer.Character
-                local playerRoot = AP_GetRoot(playerCharacter)
-                if not playerRoot then
-                    AP_SetAutoRotate(true)
-                    AP.currentTarget = nil
-                    return
+                return false
+            end
+            local function fn_ParryHelper_86e6(char,var_animationId_321b,track)
+                if var_animationId_321b.lower(var_animationId_321b)~="the hidden" then return end
+                local var_vector_6d30={name=var_animationId_321b,track=track,type="skill",started=tick(),var_rootPart_816b=false,skillId=var_rootPart_4020}
+                State.state_unhookYourself_d58e[char]=var_vector_6d30
+                local var_connection_90bd
+                var_connection_90bd=track.Stopped.Connect(track.Stopped,function()
+                    if var_connection_90bd then var_connection_90bd.Disconnect(var_connection_90bd) end
+                    task.defer(function()
+                        if State.state_unhookYourself_d58e[char] and State.state_unhookYourself_d58e[char].track==track then
+                            State.state_unhookYourself_d58e[char]=nil
+                        end
+                    end)
+                end)
+                fn_ParryHelper_285e(char,var_vector_6d30)
+            end
+            local function fn_ParryHelper_7eea(char,var_animationId_321b,track,profile,var_animationId_e8d4)
+                if not fn_ParryHelper_a725(var_animationId_321b) then return end
+                AP_Target = char
+                local var_vector_6d30={name=var_animationId_321b,track=track,type="maskedfast",started=tick(),var_rootPart_816b=false,id=var_animationId_e8d4,profile=profile}
+                State.state_unhookYourself_c84b[char]=var_vector_6d30
+                local var_connection_90bd
+                var_connection_90bd=track.Stopped.Connect(track.Stopped,function()
+                    if var_connection_90bd then var_connection_90bd.Disconnect(var_connection_90bd) end
+                    task.defer(function()
+                        if State.state_unhookYourself_c84b[char] and State.state_unhookYourself_c84b[char].track==track then
+                            State.state_unhookYourself_c84b[char]=nil
+                            if AP_Target == char then AP_Target = nil end
+                        end
+                    end)
+                end)
+                -- Detection radius is not the parry gate. The helper decides
+                -- using the killer's actual hit-range envelope.
+                if fn_ParryHelper_8596(char) then
+                    var_vector_6d30.var_rootPart_816b=true
                 end
-
-                AP_GetNetworkProfile(dt)
-
-                local bestAttack = nil
-                local bestEstimate = nil
-                local bestPriority = math.huge
-                local now = AP_Now()
-
-                for character, attack in pairs(AP.attacks) do
-                    if not character or not character.Parent or not attack.track or not attack.track.IsPlaying then
-                        if attack.connection then pcall(function() attack.connection:Disconnect() end) end
-                        AP.attacks[character] = nil
-                    elseif not attack.fired then
-                        local killerRoot = AP_GetRoot(character)
-                        if killerRoot then
-                            local estimate = AP_ImpactEstimate(attack, playerRoot, killerRoot)
-                            if estimate then
-                                attack.lastPredictedPosition = estimate.predictedKillerPosition
-
-                                -- Begin predictive facing before the actual parry window.
-                                local lead = AP_GetLatencyLead()
-                                local facePrep = 0.12 + math.clamp(lead * 0.55, 0.02, 0.14)
-                                if estimate.eta <= lead + facePrep and State.autoParryAutoFace ~= false then
-                                    AP_SetAutoRotate(false)
-                                    AP_FaceTarget(estimate.predictedKillerPosition, playerRoot, dt)
-                                    AP.currentTarget = character
+            end
+            local function fn_ParryHelper_d76c(player,char)
+                if player==LocalPlayer then return end
+                task.wait(0.5)
+                if not char.Parent then return end
+                local var_rootPart_1fbd=fn_ParryHelper_ed9e(player,char)
+                if var_rootPart_1fbd or (player.Team and player.Team.Name:lower():find("killer")) then
+                    local var_animationId_321b=var_rootPart_1fbd or "Unknown Killer"
+                    State.killerCharacters[char]={player=player,name=var_animationId_321b}
+                    char.AncestryChanged.Connect(char.AncestryChanged,function(_,var_child_a03d)
+                        if not var_child_a03d then
+                            State.killerCharacters[char]=nil
+                            State.state_unhookYourself_bfd8[char]=nil
+                            State.state_unhookYourself_d58e[char]=nil
+                            State.state_unhookYourself_c84b[char]=nil
+                        end
+                    end)
+                    local var_child_4158=char.WaitForChild(char,"Humanoid",(3.0))
+                    if var_child_4158 then
+                        local var_humanoid_e59f=var_child_4158.WaitForChild(var_child_4158,"Animator",3)
+                        if var_humanoid_e59f then
+                            var_humanoid_e59f.AnimationPlayed.Connect(var_humanoid_e59f.AnimationPlayed,function(track)
+                                if not State.autoParryEnabled then return end
+                                if not track or not track.Animation then return end
+                                local var_animationId_e8d4=track.Animation.AnimationId
+                                if var_animationId_e8d4==var_animationId_c5ef and var_animationId_321b.lower(var_animationId_321b)=="the hidden" then
+                                    fn_ParryHelper_86e6(char,var_animationId_321b,track)
+                                    return
                                 end
-
-                                local readyForParry = AP_ShouldParry(attack, estimate, playerRoot)
-                                if readyForParry then
-                                    local priority = estimate.eta + estimate.distance * 0.001
-                                    if priority < bestPriority then
-                                        bestPriority = priority
-                                        bestAttack = attack
-                                        bestEstimate = estimate
+                                local var_unknownValue_0046_32c2=var_buffer_17b3[var_animationId_e8d4]
+                                if var_unknownValue_0046_32c2 and fn_ParryHelper_a725(var_animationId_321b) then
+                                    fn_ParryHelper_7eea(char,var_animationId_321b,track,var_unknownValue_0046_32c2,tonumber(var_animationId_e8d4.match(var_animationId_e8d4,"%d+")))
+                                    return
+                                end
+                                local profile=var_selectedKiller_7096[var_animationId_e8d4]
+                                if not profile then
+                                    -- Generic fallback for Action tracks not present in the
+                                    -- static ID table. Idle locomotion names are excluded,
+                                    -- while unnamed Action tracks are still accepted because
+                                    -- the game may not expose a useful AnimationTrack.Name.
+                                    local trackLength = tonumber(track.Length) or 0
+                                    local priority = track.Priority
+                                    local isAction = priority == Enum.AnimationPriority.Action
+                                        or priority == Enum.AnimationPriority.Action2
+                                        or priority == Enum.AnimationPriority.Action3
+                                        or priority == Enum.AnimationPriority.Action4
+                                    local name = tostring(track.Name or ""):lower()
+                                    local ignored = name:find("idle",1,true)
+                                        or name:find("walk",1,true)
+                                        or name:find("run",1,true)
+                                        or name:find("jump",1,true)
+                                        or name:find("fall",1,true)
+                                        or name:find("land",1,true)
+                                        or name:find("crouch",1,true)
+                                        or name:find("emote",1,true)
+                                    local looksLikeAttack = name:find("attack",1,true)
+                                        or name:find("slash",1,true)
+                                        or name:find("lunge",1,true)
+                                        or name:find("swing",1,true)
+                                        or name:find("strike",1,true)
+                                        or name:find("hit",1,true)
+                                    if isAction and not ignored and trackLength >= 0.25 and trackLength <= 3.5 then
+                                        profile = {
+                                            type = looksLikeAttack and "attack" or "lungehold",
+                                            length = trackLength,
+                                            speed = math.max(tonumber(track.PlaybackSpeed) or 1, 0.05),
+                                            triggerProgress = 0.0,
+                                            triggerTime = 0.0,
+                                        }
+                                    else
+                                        return
                                     end
                                 end
-
-                                -- Debug-only prediction error estimate. This measures
-                                -- short-horizon positional prediction quality without
-                                -- changing the parry decision.
-                                if attack.lastPredictedPosition then
-                                    local errorDistance = (killerRoot.Position - attack.lastPredictedPosition).Magnitude
-                                    AP.predictionError = AP.predictionError * 0.90 + math.clamp(errorDistance, 0, 20) * 0.10
-                                    AP.predictionErrorSamples += 1
-                                end
-
-                                if now > AP.nextDebug and State.autoParryDebug then
-                                    AP.nextDebug = now + 0.25
-                                    Notify(
-                                        "Auto Parry",
-                                        string.format(
-                                            "Ping %.0fms | Jitter %.0fms | Lead %.0fms | ETA %.0fms | Dist %.1f | Err %.2f",
-                                            AP.smoothedPing * 1000,
-                                            AP.jitter * 1000,
-                                            AP_GetLatencyLead() * 1000,
-                                            estimate.eta * 1000,
-                                            estimate.distance,
-                                            AP.predictionError
-                                        ),
-                                        0.3
-                                    )
+                                local var_connection_5e4e=tonumber(var_animationId_e8d4.match(var_animationId_e8d4,"%d+"))
+                                local var_vector_6d30={name=var_animationId_321b,track=track,type=profile.type,id=var_connection_5e4e,profile=profile,started=tick(),var_rootPart_816b=false,lastTimePosition=(-1.0)}
+                                State.state_unhookYourself_bfd8[char]=var_vector_6d30
+                                local var_connection_90bd
+                                var_connection_90bd=track.Stopped.Connect(track.Stopped,function()
+                                    if var_connection_90bd then var_connection_90bd.Disconnect(var_connection_90bd) end
+                                    task.delay(0.15,function()
+                                        if State.state_unhookYourself_bfd8[char] and State.state_unhookYourself_bfd8[char].track==track then
+                                            State.state_unhookYourself_bfd8[char]=nil
+                                        end
+                                    end)
+                                end)
+                            end)
+                        end
+                    end
+                end
+            end
+            local function fn_ParryHelper_d4df(player)
+                if player==LocalPlayer then return end
+                if player.Character then
+                    task.spawn(function()
+                        fn_ParryHelper_d76c(player,player.Character)
+                    end)
+                end
+                player.CharacterAdded.Connect(player.CharacterAdded,function(char)
+                    task.spawn(function()
+                        fn_ParryHelper_d76c(player,char)
+                    end)
+                end)
+            end
+            for _,player in ipairs(Players.GetPlayers(Players)) do
+                if player~=LocalPlayer then fn_ParryHelper_d4df(player) end
+            end
+            Players.PlayerAdded.Connect(Players.PlayerAdded,fn_ParryHelper_d4df)
+            RegisterTask("CloseRangeMonitor",(0.0),function()
+                if not State.autoParryEnabled then return end
+                AP_UpdateNetwork(1/60)
+                local var_rootPart_f536=LocalPlayer.Character
+                local var_rootPart_f542=var_rootPart_f536 and var_rootPart_f536.FindFirstChild(var_rootPart_f536,"HumanoidRootPart")
+                if not var_rootPart_f542 then return end
+                for var_rootPart_7b16,var_rootPart_7348 in pairs(State.killerCharacters) do
+                    if not var_rootPart_7b16 or not var_rootPart_7b16.Parent then
+                        State.killerCharacters[var_rootPart_7b16]=nil
+                    else
+                        local var_rootPart_7d5e=var_rootPart_7b16.FindFirstChild(var_rootPart_7b16,"HumanoidRootPart")
+                        if var_rootPart_7d5e then
+                            local var_rootPart_b8b3=var_rootPart_f542.Position-var_rootPart_7d5e.Position
+                            local var_velocity_f84c=Vector3.new(var_rootPart_b8b3.X,0,var_rootPart_b8b3.Z)
+                            local var_rootPart_507f=var_velocity_f84c.Magnitude
+                            local var_rootPart_54ca=var_rootPart_7d5e.AssemblyLinearVelocity
+                            local var_rootPart_4893=var_rootPart_f542.AssemblyLinearVelocity
+                            local var_velocity_4168=Vector3.new(var_rootPart_54ca.X-var_rootPart_4893.X,(0.0),var_rootPart_54ca.Z-var_rootPart_4893.Z)
+                            local var_velocity_e8cb=0
+                            if var_rootPart_507f>0 then var_velocity_e8cb=var_velocity_4168.Dot(var_velocity_4168,var_velocity_f84c.Unit) end
+                            local ping=math.clamp(LocalPlayer.GetNetworkPing(LocalPlayer),0,0.3)
+                            local var_vector_5329=var_rootPart_7d5e.Position+Vector3.new(var_rootPart_54ca.X,0,var_rootPart_54ca.Z)*ping
+                            local var_vector_41df=var_rootPart_f542.Position+Vector3.new(var_rootPart_4893.X,0,var_rootPart_4893.Z)*ping
+                            local var_predictedPosition_dd8a=(Vector3.new(var_vector_41df.X,0,var_vector_41df.Z)-Vector3.new(var_vector_5329.X,0,var_vector_5329.Z)).Magnitude
+                            local var_vector_dcf7=false
+                            if var_rootPart_507f<=var_vector_725f then
+                                var_vector_dcf7=true
+                            elseif var_rootPart_507f<=var_originalValue_33aa and var_velocity_e8cb>=var_originalValue_b2ae then
+                                local var_originalValue_66c1=var_rootPart_507f/var_velocity_e8cb
+                                if var_originalValue_66c1<=var_originalValue_1f11 or var_predictedPosition_dd8a<=3.75 then var_vector_dcf7=true end
+                            end
+                            if var_vector_dcf7 then
+                                local var_vector_6d30=State.state_unhookYourself_bfd8[var_rootPart_7b16]
+                                if var_vector_6d30 and not var_vector_6d30.var_rootPart_816b then
+                                    if fn_ParryHelper_e2ea(true,var_rootPart_7b16,var_rootPart_507f) then var_vector_6d30.var_rootPart_816b=true end
                                 end
                             end
                         end
                     end
                 end
-
-                if bestAttack and bestEstimate then
-                    local finalFacingOk = true
-                    if State.autoParryAutoFace ~= false then
-                        AP_SetAutoRotate(false)
-                        AP_FaceTarget(bestEstimate.predictedKillerPosition, playerRoot, dt)
-                        finalFacingOk = AP_IsFacing(bestEstimate.predictedKillerPosition, playerRoot)
-                    end
-
-                    if finalFacingOk and AP_LineOfSight(bestAttack.character, playerRoot) then
-                        if AP_DoParry() then
-                            bestAttack.fired = true
-                            AP.currentTarget = bestAttack.character
+            end)
+            RegisterTask("AttackersMonitor",0,function()
+                if not State.autoParryEnabled then return end
+                AP_UpdateNetwork(1/60)
+                if next(State.state_unhookYourself_bfd8)==nil then return end
+                for var_rootPart_7b16,var_vector_6d30 in pairs(State.state_unhookYourself_bfd8) do
+                    if not var_rootPart_7b16 or not var_rootPart_7b16.Parent or not var_vector_6d30.track then
+                        State.state_unhookYourself_bfd8[var_rootPart_7b16]=nil
+                    elseif not var_vector_6d30.track.IsPlaying then
+                        State.state_unhookYourself_bfd8[var_rootPart_7b16]=nil
+                    elseif not var_vector_6d30.var_rootPart_816b then
+                        local profile=var_vector_6d30.profile
+                        local var_rootPart_7d5e=var_rootPart_7b16.FindFirstChild(var_rootPart_7b16,"HumanoidRootPart")
+                        local var_rootPart_f536=LocalPlayer.Character
+                        local var_rootPart_f542=var_rootPart_f536 and var_rootPart_f536.FindFirstChild(var_rootPart_f536,"HumanoidRootPart")
+                        if var_rootPart_7d5e and var_rootPart_f542 and profile then
+                            AP_Target = var_rootPart_7b16
+                            -- Face only when the active attack is approaching its
+                            -- physical hit range. State.parryRadius is detection/ESP only.
+                            if AP_ShouldStartFacing(var_rootPart_7b16, var_vector_6d30) then
+                                AP_FaceKiller(var_rootPart_7b16, AP_GetLead())
+                            end
+                            local var_rootPart_b8b3=var_rootPart_f542.Position-var_rootPart_7d5e.Position
+                            local var_rootPart_507f=var_rootPart_b8b3.Magnitude
+                            local var_velocity_ae23=var_rootPart_7d5e.AssemblyLinearVelocity
+                            local var_rootPart_4893=var_rootPart_f542.AssemblyLinearVelocity
+                            local var_velocity_caa2=Vector3.new(var_velocity_ae23.X,(0.0),var_velocity_ae23.Z)
+                            local var_velocity_3202=Vector3.new(var_rootPart_4893.X,0,var_rootPart_4893.Z)
+                            local var_velocity_f84c=Vector3.new(var_rootPart_b8b3.X,(0.0),var_rootPart_b8b3.Z)
+                            local var_velocity_e8cb=(0.0)
+                            if var_velocity_f84c.Magnitude>0 then
+                                var_velocity_e8cb=Vector3.new(var_velocity_caa2.X-var_velocity_3202.X,0,var_velocity_caa2.Z-var_velocity_3202.Z):Dot(var_velocity_f84c.Unit)
+                            end
+                            local var_vector_2c81=false
+                            if var_rootPart_507f<=var_vector_725f then
+                                var_vector_2c81=true
+                            elseif var_rootPart_507f<=var_originalValue_33aa and var_velocity_e8cb>=var_originalValue_b2ae then
+                                local var_originalValue_66c1=var_rootPart_507f/var_velocity_e8cb
+                                if var_originalValue_66c1<=var_originalValue_1f11 then var_vector_2c81=true end
+                            end
+                            if var_vector_2c81 then
+                                if fn_ParryHelper_e2ea(true,var_rootPart_7b16,var_rootPart_507f) then var_vector_6d30.var_rootPart_816b=true end
+                            else
+                                local var_originalValue_2bcd=var_vector_6d30.track.TimePosition or (0.0)
+                                local var_unknownValue_0037_c046=var_vector_6d30.track.Length
+                                local length=(var_unknownValue_0037_c046 and var_unknownValue_0037_c046>0) and var_unknownValue_0037_c046 or profile.length
+                                local speed=profile.speed
+                                local var_unknownValue_0010_3242=var_originalValue_2bcd*speed
+                                local var_unknownValue_0029_ab99=length/speed
+                                local var_originalValue_cf3e=var_unknownValue_0029_ab99>0 and var_unknownValue_0010_3242/var_unknownValue_0029_ab99 or 0
+                                local triggerTime=profile.triggerTime/profile.speed
+                                local triggerProgress=profile.triggerProgress
+                                local var_originalValue_6ce9=var_originalValue_2bcd>=triggerTime or var_originalValue_cf3e>=triggerProgress
+                                local var_originalValue_9380=false
+                                local var_originalValue_cd78=false
+                                if profile.type=="lungehold" then
+                                    local var_originalValue_5b1e=3.5
+                                    local var_originalValue_b360=math.max(var_rootPart_507f-var_originalValue_5b1e,0)
+                                    local var_originalValue_66c1=math.huge
+                                    if var_velocity_e8cb>0 then var_originalValue_66c1=var_originalValue_b360/var_velocity_e8cb end
+                                    var_originalValue_9380=var_velocity_e8cb>=(6.0) and var_originalValue_66c1<=0.32
+                                    var_originalValue_cd78=var_velocity_e8cb>=4 and var_originalValue_66c1<=0.16
+                                end
+                                if var_originalValue_6ce9 or var_originalValue_9380 or var_originalValue_cd78 then
+                                    do
+                                        local var_predictedPosition_5269=true
+                                        if var_velocity_f84c.Magnitude>(0.0) and var_velocity_caa2.Magnitude>8 then
+                                            var_predictedPosition_5269=var_velocity_caa2.Unit.Dot(var_velocity_caa2.Unit,var_velocity_f84c.Unit)>=-0.1
+                                        end
+                                        if var_predictedPosition_5269 then
+                                            -- Prediction may refine timing, but the helper
+                                            -- still requires actual hit-range proximity.
+                                            if fn_ParryHelper_e2ea(false,var_rootPart_7b16,var_rootPart_507f) then
+                                                var_vector_6d30.var_rootPart_816b=true
+                                            end
+                                        end
+                                    end
+                                end
+                            end
                         end
                     end
                 end
-
-                local hasLiveAttack = false
-                for character, attack in pairs(AP.attacks) do
-                    if character and character.Parent and attack and attack.track and attack.track.IsPlaying and not attack.fired then
-                        hasLiveAttack = true
-                        break
+            end)
+            RunService.Heartbeat.Connect(RunService.Heartbeat,function(dt)
+                if not State.autoParryEnabled then
+                    local character = LocalPlayer.Character
+                    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+                    if humanoid and AP_RotateUntil <= os.clock() then pcall(function() humanoid.AutoRotate = true end) end
+                    AP_Target = nil
+                    return
+                end
+                AP_UpdateNetwork(dt)
+                local var_rootPart_f536=LocalPlayer.Character
+                local var_rootPart_f542=var_rootPart_f536 and var_rootPart_f536.FindFirstChild(var_rootPart_f536,"HumanoidRootPart")
+                if not var_rootPart_f542 then return end
+                local var_rootPart_d698=var_rootPart_f542.Position
+                local var_rootPart_4893=var_rootPart_f542.AssemblyLinearVelocity
+                local var_velocity_17fa=Vector3.new(var_rootPart_4893.X,0,var_rootPart_4893.Z)
+                for var_rootPart_7b16,var_vector_6d30 in pairs(State.state_unhookYourself_d58e) do
+                    if not var_rootPart_7b16 or not var_rootPart_7b16.Parent or not var_vector_6d30 or not var_vector_6d30.track then
+                        State.state_unhookYourself_d58e[var_rootPart_7b16]=nil
+                    elseif not var_vector_6d30.track.IsPlaying then
+                        State.state_unhookYourself_d58e[var_rootPart_7b16]=nil
+                    elseif not var_vector_6d30.var_rootPart_816b and var_vector_6d30.skillId==var_rootPart_4020 and var_vector_6d30.name and var_vector_6d30.name.lower(var_vector_6d30.name)=="the hidden" then
+                        local var_rootPart_7d5e=var_rootPart_7b16.FindFirstChild(var_rootPart_7b16,"HumanoidRootPart")
+                        if var_rootPart_7d5e then
+                            local var_rootPart_642a=var_rootPart_7d5e.Position
+                            local var_rootPart_54ca=var_rootPart_7d5e.AssemblyLinearVelocity
+                            local var_velocity_5830=Vector3.new(var_rootPart_54ca.X,0,var_rootPart_54ca.Z)
+                            local var_velocity_f84c=Vector3.new(var_rootPart_d698.X-var_rootPart_642a.X,(0.0),var_rootPart_d698.Z-var_rootPart_642a.Z)
+                            local var_rootPart_507f=var_velocity_f84c.Magnitude
+                            if var_rootPart_507f<=State.parryRadius then
+                                -- This is only a scan optimization; the helper still
+                                -- requires the actual hit-range envelope.
+                                if fn_ParryHelper_8596(var_rootPart_7b16) then var_vector_6d30.var_rootPart_816b=true end
+                            else
+                                local var_distance_f47e=var_velocity_5830-var_velocity_17fa
+                                local var_velocity_e8cb=var_velocity_f84c.Magnitude>0 and var_distance_f47e.Dot(var_distance_f47e,var_velocity_f84c.Unit) or 0
+                                if var_velocity_e8cb>0 then
+                                    local var_predictedPosition_dd8a=var_rootPart_507f-var_velocity_e8cb*var_buffer_706c
+                                    if var_predictedPosition_dd8a<=var_buffer_3f09 then
+                                        local var_unknownValue_0063_72bb=fn_ParryHandler_cf19(var_rootPart_7b16)
+                                        if var_unknownValue_0063_72bb<=var_buffer_3f09 then
+                                            if fn_ParryHelper_8596(var_rootPart_7b16) then var_vector_6d30.var_rootPart_816b=true end
+                                        end
+                                    end
+                                end
+                            end
+                        end
                     end
                 end
-                if not hasLiveAttack then
-                    AP_SetAutoRotate(true)
-                    AP.currentTarget = nil
+                for var_rootPart_7b16,var_vector_6d30 in pairs(State.state_unhookYourself_c84b) do
+                    if not var_rootPart_7b16 or not var_rootPart_7b16.Parent or not var_vector_6d30 or not var_vector_6d30.track then
+                        State.state_unhookYourself_c84b[var_rootPart_7b16]=nil
+                    elseif not var_vector_6d30.track.IsPlaying then
+                        State.state_unhookYourself_c84b[var_rootPart_7b16]=nil
+                    elseif not var_vector_6d30.var_rootPart_816b and fn_ParryHelper_a725(var_vector_6d30.name) then
+                        local var_rootPart_7d5e=var_rootPart_7b16.FindFirstChild(var_rootPart_7b16,"HumanoidRootPart")
+                        if var_rootPart_7d5e then
+                            local var_rootPart_642a=var_rootPart_7d5e.Position
+                            local var_rootPart_54ca=var_rootPart_7d5e.AssemblyLinearVelocity
+                            local var_velocity_5830=Vector3.new(var_rootPart_54ca.X,(0.0),var_rootPart_54ca.Z)
+                            local var_velocity_f84c=Vector3.new(var_rootPart_d698.X-var_rootPart_642a.X,0,var_rootPart_d698.Z-var_rootPart_642a.Z)
+                            local var_rootPart_507f=var_velocity_f84c.Magnitude
+                            if var_rootPart_507f<=State.parryRadius then
+                                if fn_ParryHelper_8596(var_rootPart_7b16) then var_vector_6d30.var_rootPart_816b=true end
+                            else
+                                local var_distance_f47e=var_velocity_5830-var_velocity_17fa
+                                local var_velocity_e8cb=var_velocity_f84c.Magnitude>0 and var_distance_f47e.Dot(var_distance_f47e,var_velocity_f84c.Unit) or (0.0)
+                                if var_velocity_e8cb>0 then
+                                    local var_predictedPosition_dd8a=var_rootPart_507f-var_velocity_e8cb*0.05
+                                    if var_predictedPosition_dd8a<=State.parryRadius then
+                                        local var_unknownValue_0063_72bb=fn_ParryHandler_cf19(var_rootPart_7b16)
+                                        if var_unknownValue_0063_72bb<=State.parryRadius then
+                                            if fn_ParryHelper_8596(var_rootPart_7b16) then var_vector_6d30.var_rootPart_816b=true end
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
                 end
             end)
 
-            -- Compatibility helper: instant parry used by the old code paths.
-            -- It now uses the same adaptive throttle and performs the directional
-            -- check before sending the input.
-            local function fn_ParryHelper_8596()
-                if not State.autoParryEnabled then return false end
-                local character = LocalPlayer.Character
-                local root = AP_GetRoot(character)
-                if not root then return false end
 
-                local targetCharacter = AP.currentTarget
-                local targetRoot = targetCharacter and AP_GetRoot(targetCharacter)
-                if targetRoot then
-                    local targetPosition = targetRoot.Position + AP_Horizontal(targetRoot.AssemblyLinearVelocity) * AP_GetLatencyLead()
-                    if State.autoParryAutoFace ~= false then
-                        AP_SetAutoRotate(false)
-                        AP_FaceTarget(targetPosition, root, AP.frameTime)
-                    end
-                    if not AP_LineOfSight(targetCharacter, root) then return false end
-                    if State.autoParryAutoFace ~= false and not AP_IsFacing(targetPosition, root) then return false end
+            local var_connection_c9ad    = {}
+            local var_rootPart_5e29    = nil
+            local var_connection_ac22   = {}
+            local var_vector_6e33   = (32.0)
+            local var_connection_ccac = (-1.0)
+
+            local function fn_ParryHandler_6733()
+                for _, var_player_2e5f in ipairs(var_connection_c9ad) do
+                    if var_player_2e5f and var_player_2e5f.Parent then var_player_2e5f.Destroy(var_player_2e5f) end
                 end
+                var_connection_c9ad  = {}
+                var_connection_ac22 = {}
 
-                return AP_DoParry()
-            end
-
-            -- Compatibility helper retained for other code in this script.
-            local function fn_ParryHelper_e2ea(_, character, distance)
-                if not State.autoParryEnabled then return false end
-                if character and distance and distance > State.parryRadius then return false end
-                return fn_ParryHelper_8596()
-            end
-
-            ----------------------------------------------------------------------
-            -- Parry radius visualization (kept compatible with existing UI)
-            ----------------------------------------------------------------------
-            local radiusSegments = 48
-            local radiusParts = {}
-            local radiusGeometry = {}
-            local radiusConnection = nil
-            local currentRadius = -1
-
-            local function BuildRadiusESP()
-                for _, part in ipairs(radiusParts) do
-                    if part and part.Parent then part:Destroy() end
-                end
-                radiusParts = {}
-                radiusGeometry = {}
-
-                local angleStep = (2 * math.pi) / radiusSegments
-                for i = 1, radiusSegments do
-                    local a0 = angleStep * (i - 1)
-                    local a1 = angleStep * i
-                    radiusGeometry[i] = {
-                        cx = math.cos(a0), cz = math.sin(a0),
-                        nx = math.cos(a1), nz = math.sin(a1),
+                local var_unknownValue_0060_6927 = (2 * math.pi) / var_vector_6e33
+                for var_remoteEvent_5dde = (1.0), var_vector_6e33 do
+                    local var_error_6022     = var_unknownValue_0060_6927 * (var_remoteEvent_5dde - 1)
+                    local var_part_7b10 = var_unknownValue_0060_6927 * var_remoteEvent_5dde
+                    var_connection_ac22[var_remoteEvent_5dde] = {
+                        cx  = math.cos(var_error_6022),
+                        cz  = math.sin(var_error_6022),
+                        nx  = math.cos(var_part_7b10),
+                        nz  = math.sin(var_part_7b10),
                     }
 
-                    local part = Instance.new("Part")
-                    part.Anchored = true
-                    part.CanCollide = false
-                    part.CanQuery = false
-                    part.CastShadow = false
-                    part.Material = Enum.Material.Neon
-                    part.Color = Color3.fromRGB(255, 60, 60)
-                    part.Transparency = 0.15
-                    part.Size = Vector3.new(0.08, 0.08, 0.1)
-                    part.Name = "BolongESP_Seg"
-                    part.Parent = workspace
-                    radiusParts[i] = part
+                    local var_vector_2eb6 = Instance.new("Part")
+                    var_vector_2eb6.Shape        = Enum.PartType.Block
+                    var_vector_2eb6.Anchored     = true
+                    var_vector_2eb6.CanCollide   = false
+                    var_vector_2eb6.CanQuery     = false
+                    var_vector_2eb6.CastShadow   = false
+                    var_vector_2eb6.Material     = Enum.Material.Neon
+                    var_vector_2eb6.Color        = Color3.fromRGB((255.0), 60, (60.0))
+                    var_vector_2eb6.Transparency = 0.15
+                    var_vector_2eb6.Size         = Vector3.new(0.08, 0.08, 0.1)
+                    var_vector_2eb6.Name         = "BolongESP_Seg"
+                    var_vector_2eb6.Parent       = WorkspaceService
+                    var_connection_c9ad[var_remoteEvent_5dde]       = var_vector_2eb6
                 end
             end
 
-            local function UpdateRadiusESPSize(radius)
-                local segmentLength = (2 * math.pi * radius) / radiusSegments
-                for _, part in ipairs(radiusParts) do
-                    if part and part.Parent then
-                        part.Size = Vector3.new(0.08, 0.08, segmentLength + 0.02)
+            local function fn_ParryHandler_f870(var_rootPart_985f)
+                local var_vector_59d4 = (2 * math.pi * var_rootPart_985f) / var_vector_6e33
+                for _, var_vector_2eb6 in ipairs(var_connection_c9ad) do
+                    if var_vector_2eb6 and var_vector_2eb6.Parent then
+                        var_vector_2eb6.Size = Vector3.new(0.08, 0.08, var_vector_59d4 + 0.02)
                     end
                 end
             end
 
-            local function ClearRadiusESP()
-                if radiusConnection then
-                    radiusConnection:Disconnect()
-                    radiusConnection = nil
+            local function fn_ParryHandler_686e()
+                for _, var_player_2e5f in ipairs(var_connection_c9ad) do
+                    if var_player_2e5f and var_player_2e5f.Parent then var_player_2e5f.Destroy(var_player_2e5f) end
                 end
-                for _, part in ipairs(radiusParts) do
-                    if part and part.Parent then part:Destroy() end
-                end
-                radiusParts = {}
-                radiusGeometry = {}
-                currentRadius = -1
+                var_connection_c9ad  = {}
+                var_connection_ac22 = {}
+                var_connection_ccac = (-1.0)
             end
 
-            function fn_ParryHelper_6254(enabled)
-                if enabled then
-                    ClearRadiusESP()
-                    BuildRadiusESP()
-                    radiusConnection = RunService.RenderStepped:Connect(function()
-                        local character = LocalPlayer.Character
-                        local root = AP_GetRoot(character)
-                        if not root then return end
+            function fn_ParryHelper_6254(var_rootPart_42db)
+                if var_rootPart_42db then
+                    fn_ParryHandler_6733()
+                    var_rootPart_5e29 = RunService.RenderStepped.Connect(RunService.RenderStepped,function()
+                        if not LocalPlayer.Character then return end
+                        local var_rootPart_186c = LocalPlayer.Character.FindFirstChild(LocalPlayer.Character,"HumanoidRootPart")
+                        if not var_rootPart_186c then return end
 
-                        local radius = State.parryRadius
-                        if radius ~= currentRadius then
-                            UpdateRadiusESPSize(radius)
-                            currentRadius = radius
+                        local var_rootPart_985f = State.parryRadius
+                        if var_rootPart_985f ~= var_connection_ccac then
+                            fn_ParryHandler_f870(var_rootPart_985f)
+                            var_connection_ccac = var_rootPart_985f
                         end
 
-                        local center = root.Position - Vector3.new(0, root.Size.Y / 2 + 1.5, 0)
-                        for index, part in ipairs(radiusParts) do
-                            local geo = radiusGeometry[index]
-                            if geo and part and part.Parent then
-                                local p0 = center + Vector3.new(geo.cx * radius, 0, geo.cz * radius)
-                                local p1 = center + Vector3.new(geo.nx * radius, 0, geo.nz * radius)
-                                part.CFrame = CFrame.lookAt(p0, p1) * CFrame.new(0, 0, -part.Size.Z / 2)
+                        local var_rootPart_1bb5 = var_rootPart_186c.Position - Vector3.new((0.0), var_rootPart_186c.Size.Y / 2 + 1.5, 0)
+
+                        for var_remoteEvent_5dde, var_vector_2eb6 in ipairs(var_connection_c9ad) do
+                            if var_vector_2eb6 and var_vector_2eb6.Parent then
+                                local var_connection_d9f3   = var_connection_ac22[var_remoteEvent_5dde]
+                                local pos = var_rootPart_1bb5 + Vector3.new(var_connection_d9f3.cx * var_rootPart_985f, 0, var_connection_d9f3.cz * var_rootPart_985f)
+                                local var_connection_d723 = var_rootPart_1bb5 + Vector3.new(var_connection_d9f3.nx * var_rootPart_985f, 0, var_connection_d9f3.nz * var_rootPart_985f)
+                                var_vector_2eb6.CFrame = CFrame.lookAt(pos, var_connection_d723) * CFrame.new(0, 0, -var_vector_2eb6.Size.Z / 2)
                             end
                         end
                     end)
                 else
-                    ClearRadiusESP()
+                    if var_rootPart_5e29 then var_rootPart_5e29.Disconnect(var_rootPart_5e29)
+                    var_rootPart_5e29 = nil end
+                    fn_ParryHandler_686e()
                 end
             end
         end
@@ -11762,7 +11848,8 @@ local function BolongHub()
                 end,
             })
             var_section_2baa.AddSlider(var_section_2baa,{
-                Title = "Parry Radius (Stud)", Min = 4, Max = 40, Default = (11.0), Increment = 1,
+                Title = "Detection Radius (Stud)", Min = 4, Max = 40, Default = (11.0), Increment = 1,
+                Content = "Hanya menentukan radius deteksi/ESP; bukan jarak parry.",
                 Callback = function(var_value_d1f9)
                     State.parryRadius = var_value_d1f9
                 end,
@@ -11814,7 +11901,7 @@ local function BolongHub()
 
 
     -- ============================================================
-    -- SILENT SPEAR / VEIL — BIDIKAN TERSEMBUNYI
+    -- SILENT SPEAR / VEIL â€” BIDIKAN TERSEMBUNYI
     -- ============================================================
         local var_section_7b3c = ExclusiveTab.AddSection(ExclusiveTab,"Silent Spear (Veil)", nil)
             var_section_7b3c.AddParagraph(var_section_7b3c,{
@@ -11868,7 +11955,7 @@ local function BolongHub()
 
 
     -- ============================================================
-    -- SILENT AIM / TWIST OF FATE — BIDIKAN TERSEMBUNYI
+    -- SILENT AIM / TWIST OF FATE â€” BIDIKAN TERSEMBUNYI
     -- ============================================================
         local var_section_1ca8 = ExclusiveTab.AddSection(ExclusiveTab,"Silent Aim (Twist of Fate)", nil)
             var_section_1ca8.AddToggle(var_section_1ca8,{
@@ -11966,7 +12053,7 @@ local function BolongHub()
 
 
     -- ============================================================
-    -- AIMLOCK FLASHLIGHT — KUNCI TARGET FLASHLIGHT
+    -- AIMLOCK FLASHLIGHT â€” KUNCI TARGET FLASHLIGHT
     -- ============================================================
         local var_section_d782 = ExclusiveTab.AddSection(ExclusiveTab,"Aimlock Flashlight", nil)
             var_section_d782.AddToggle(var_section_d782,{
@@ -11985,7 +12072,7 @@ local function BolongHub()
 
 
     -- ============================================================
-    -- AIM LOCK — KUNCI BIDIKAN
+    -- AIM LOCK â€” KUNCI BIDIKAN
     -- ============================================================
         local var_section_8947 = ExclusiveTab.AddSection(ExclusiveTab,"Aim Lock (Legit)", nil)
             var_section_8947.AddToggle(var_section_8947,{
@@ -12052,7 +12139,7 @@ local function BolongHub()
 
 
     -- ============================================================
-    -- HITBOX MODIFIER — MODIFIKASI HITBOX
+    -- HITBOX MODIFIER â€” MODIFIKASI HITBOX
     -- ============================================================
         local var_section_e824 = KillerTab.AddSection(KillerTab,"Hitbox Modifier", nil)
             var_section_e824.AddToggle(var_section_e824,{
@@ -12163,7 +12250,7 @@ local function BolongHub()
 
 
     -- ============================================================
-    -- MAYERS / STALKER — TANPA COOLDOWN
+    -- MAYERS / STALKER â€” TANPA COOLDOWN
     -- ============================================================
         local var_section_eefa = KillerTab.AddSection(KillerTab,"Mayers (Stalker) No Cooldown", nil)
             var_section_eefa.AddToggle(var_section_eefa,{
@@ -12253,7 +12340,7 @@ local function BolongHub()
 
 
     -- ============================================================
-    -- HIDDEN M2 AIMLOCK — KUNCI M2
+    -- HIDDEN M2 AIMLOCK â€” KUNCI M2
     -- ============================================================
         local var_section_b953 = KillerTab.AddSection(KillerTab,"Aimlock M2 Skill Hidden", nil)
             var_section_b953.AddToggle(var_section_b953,{
@@ -12372,7 +12459,7 @@ local function BolongHub()
 
 
     -- ============================================================
-    -- AUTO GENERATOR — OTOMATISASI GENERATOR
+    -- AUTO GENERATOR â€” OTOMATISASI GENERATOR
     -- ============================================================
         local var_section_fffd = SurvivorTab.AddSection(SurvivorTab,"Auto Generator", nil)
             var_section_fffd.AddToggle(var_section_fffd,{
@@ -12386,7 +12473,7 @@ local function BolongHub()
             })
 
     -- ============================================================
-    -- GENERATOR BOOST — PENINGKATAN GENERATOR
+    -- GENERATOR BOOST â€” PENINGKATAN GENERATOR
     -- ============================================================
         local var_section_3e7c = SurvivorTab.AddSection(SurvivorTab,"Generator Boost", nil)
             var_section_3e7c.AddToggle(var_section_3e7c,{
@@ -12633,7 +12720,7 @@ local function BolongHub()
 
 
     -- ============================================================
-    -- KILLER ESP — DETEKSI KILLER
+    -- KILLER ESP â€” DETEKSI KILLER
     -- ============================================================
         local var_section_2a91 = VisualTab.AddSection(VisualTab,"Killer ESP", nil)
             local var_section_9f9a = var_section_2a91.AddHStack(var_section_2a91)
@@ -12655,7 +12742,7 @@ local function BolongHub()
             })
 
     -- ============================================================
-    -- SURVIVOR ESP — DETEKSI SURVIVOR
+    -- SURVIVOR ESP â€” DETEKSI SURVIVOR
     -- ============================================================
         local var_section_aa54 = VisualTab.AddSection(VisualTab,"Survivor ESP", nil)
             local var_section_7e05 = var_section_aa54.AddHStack(var_section_aa54)
@@ -12676,7 +12763,7 @@ local function BolongHub()
             })
 
     -- ============================================================
-    -- ZOMBIE / SCP ESP — DETEKSI NPC
+    -- ZOMBIE / SCP ESP â€” DETEKSI NPC
     -- ============================================================
         local var_section_c4cc = VisualTab.AddSection(VisualTab,"Zombie / SCP ESP", nil)
             var_section_c4cc.AddToggle(var_section_c4cc,{
