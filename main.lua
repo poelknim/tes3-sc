@@ -6922,6 +6922,7 @@ local function BolongHub()
             local lastParryAt = -math.huge
             local lastParryResultAt = -math.huge
             local pendingByCharacter = {}
+            local TriggerSmoothFace
 
             local function GetParryRemote()
                 if parryRemoteResolved then
@@ -7264,6 +7265,7 @@ local function BolongHub()
                         return
                     end
 
+                    TriggerSmoothFace(killerCharacter)
                     FireParry()
                 end)
             end
@@ -7272,82 +7274,129 @@ local function BolongHub()
 
             ----------------------------------------------------------------------
             -- SMOOTH FACE
-            -- Independent from Parry decision/timing. It only rotates the local
-            -- survivor toward an eligible killer while Auto Parry is active.
+            -- Event-driven only: it activates when an actual killer attack reaches
+            -- the same hit-reaction gate used by Auto Parry. It does NOT track or
+            -- face nearby killers continuously.
+            -- 360-degree reaction is provided by attack-event detection; there is
+            -- no angle restriction on the face reaction itself.
+            -- The target position is snapshotted once per reaction to prevent
+            -- continuous orbiting/spinning around a moving killer.
             ----------------------------------------------------------------------
             local smoothFacePreviousAutoRotate = true
             local smoothFaceWasApplied = false
+            local smoothFaceTargetPosition = nil
+            local smoothFaceActiveUntil = 0
+            local SMOOTH_FACE_DURATION = 0.20
 
-            local function GetSmoothFaceTarget()
+            local function IsLocalCharacterBlockedForSmoothFace()
                 local character = LocalPlayer.Character
-                local root = character and character:FindFirstChild("HumanoidRootPart")
-                if not root then return nil end
+                local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+                if not character or not humanoid or humanoid.Health <= 0 then
+                    return true
+                end
+                if LocalPlayer:GetAttribute("IsDead") then
+                    return true
+                end
 
-                local bestCharacter = nil
-                local bestDistance = math.huge
-                local detectDistance = (tonumber(State.parryRadius) or 11) + AUTO_PARRY_DETECT_PADDING
-
-                for humanoid, entry in pairs(connectedKillerHumanoids) do
-                    if humanoid and humanoid.Parent and entry then
-                        local killerCharacter = humanoid.Parent
-                        local killerRoot = killerCharacter:FindFirstChild("HumanoidRootPart")
-                        if killerRoot then
-                            local distance = (killerRoot.Position - root.Position).Magnitude
-                            if distance <= detectDistance and distance < bestDistance then
-                                local attackActive = false
-                                local animator = entry.anim
-                                if animator then
-                                    local ok, tracks = pcall(function()
-                                        return animator:GetPlayingAnimationTracks()
-                                    end)
-                                    if ok and type(tracks) == "table" then
-                                        for _, track in ipairs(tracks) do
-                                            if IsAttackTrack(track) and (track.TimePosition or 0) < 0.55 then
-                                                attackActive = true
-                                                break
-                                            end
-                                        end
-                                    end
-                                end
-
-                                -- Face nearby killers during an active swing, and also
-                                -- when already inside the actual parry range.
-                                if attackActive or distance <= (AUTO_PARRY_HIT_RANGE + 2.0) then
-                                    bestCharacter = killerCharacter
-                                    bestDistance = distance
-                                end
+                local blockedAttributes = {
+                    "Knocked", "isDowned", "isKnocked", "downed", "knockdown", "isKnockdown",
+                    "IsCarried", "IsHooked",
+                }
+                local root = character:FindFirstChild("HumanoidRootPart")
+                local checkObjects = {character, root, humanoid}
+                for _, object in ipairs(checkObjects) do
+                    if object then
+                        for _, attributeName in ipairs(blockedAttributes) do
+                            if object:GetAttribute(attributeName) then
+                                return true
                             end
                         end
                     end
                 end
+                if humanoid.PlatformStand then
+                    return true
+                end
+                return false
+            end
 
-                return bestCharacter
+            local function StopSmoothFace()
+                smoothFaceActiveUntil = 0
+                smoothFaceTargetPosition = nil
+                if smoothFaceWasApplied then
+                    pcall(function()
+                        local character = LocalPlayer.Character
+                        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+                        if humanoid then
+                            humanoid.AutoRotate = smoothFacePreviousAutoRotate
+                        end
+                    end)
+                    smoothFaceWasApplied = false
+                end
+            end
+
+            TriggerSmoothFace = function(killerCharacter)
+                if not State.autoParryEnabled or not State.autoParryAutoFace then
+                    return
+                end
+                if IsLocalCharacterBlockedForSmoothFace() then
+                    StopSmoothFace()
+                    return
+                end
+
+                local character = LocalPlayer.Character
+                local root = character and character:FindFirstChild("HumanoidRootPart")
+                local killerRoot = killerCharacter and killerCharacter:FindFirstChild("HumanoidRootPart")
+                if not root or not killerRoot then
+                    return
+                end
+
+                local delta = killerRoot.Position - root.Position
+                local flat = Vector3.new(delta.X, 0, delta.Z)
+                if flat.Magnitude <= 0.05 then
+                    return
+                end
+
+                -- Small one-shot lead, captured at reaction time. This is not a
+                -- continuously updated target, so it cannot produce orbiting.
+                local lead = math.clamp(tonumber(State.autoParryFaceLead) or 0.08, 0, 0.12)
+                local velocity = killerRoot.AssemblyLinearVelocity
+                smoothFaceTargetPosition = killerRoot.Position + Vector3.new(
+                    velocity.X * lead,
+                    0,
+                    velocity.Z * lead
+                )
+                smoothFaceActiveUntil = tick() + SMOOTH_FACE_DURATION
             end
 
             local function UpdateSmoothFace(dt)
+                if not State.autoParryEnabled or not State.autoParryAutoFace then
+                    StopSmoothFace()
+                    return
+                end
+                if IsLocalCharacterBlockedForSmoothFace() then
+                    StopSmoothFace()
+                    return
+                end
+                if tick() >= smoothFaceActiveUntil or not smoothFaceTargetPosition then
+                    StopSmoothFace()
+                    return
+                end
+
                 local character = LocalPlayer.Character
                 local humanoid = character and character:FindFirstChildOfClass("Humanoid")
                 local root = character and character:FindFirstChild("HumanoidRootPart")
                 if not humanoid or not root then
-                    smoothFaceWasApplied = false
+                    StopSmoothFace()
                     return
                 end
 
-                if not State.autoParryEnabled or not State.autoParryAutoFace then
-                    if smoothFaceWasApplied then
-                        pcall(function() humanoid.AutoRotate = smoothFacePreviousAutoRotate end)
-                        smoothFaceWasApplied = false
-                    end
-                    return
-                end
-
-                local targetCharacter = GetSmoothFaceTarget()
-                local targetRoot = targetCharacter and targetCharacter:FindFirstChild("HumanoidRootPart")
-                if not targetRoot then
-                    if smoothFaceWasApplied then
-                        pcall(function() humanoid.AutoRotate = smoothFacePreviousAutoRotate end)
-                        smoothFaceWasApplied = false
-                    end
+                local flatDirection = Vector3.new(
+                    smoothFaceTargetPosition.X - root.Position.X,
+                    0,
+                    smoothFaceTargetPosition.Z - root.Position.Z
+                )
+                if flatDirection.Magnitude <= 0.05 then
+                    StopSmoothFace()
                     return
                 end
 
@@ -7357,29 +7406,13 @@ local function BolongHub()
                 end
                 pcall(function() humanoid.AutoRotate = false end)
 
-                local lead = math.clamp(tonumber(State.autoParryFaceLead) or 0.08, 0, 0.20)
-                local targetVelocity = targetRoot.AssemblyLinearVelocity
-                local aimPosition = targetRoot.Position + Vector3.new(
-                    targetVelocity.X * lead,
-                    0,
-                    targetVelocity.Z * lead
-                )
-                local flatDirection = Vector3.new(
-                    aimPosition.X - root.Position.X,
-                    0,
-                    aimPosition.Z - root.Position.Z
-                )
-                if flatDirection.Magnitude <= 0.05 then
-                    return
-                end
-
-                local smoothness = math.max(2, math.min(30, tonumber(State.autoParryFaceSmoothness) or 14))
-                local alpha = 1 - math.exp(-smoothness * math.max(dt or 0, 0))
+                local smoothness = math.clamp(tonumber(State.autoParryFaceSmoothness) or 14, 2, 30)
+                local alpha = 1 - math.exp(-smoothness * math.max(tonumber(dt) or 0, 0))
                 local desired = CFrame.lookAt(root.Position, root.Position + flatDirection.Unit)
-                root.CFrame = root.CFrame:Lerp(desired, math.clamp(alpha, 0, 1))
+                pcall(function()
+                    root.CFrame = root.CFrame:Lerp(desired, math.clamp(alpha, 0, 1))
+                end)
             end
-
-
 
             local function RegisterKiller(player, character)
                 if not player or player == LocalPlayer or not character then
@@ -7404,16 +7437,24 @@ local function BolongHub()
                     end
 
                     _G.BOLONG_KILLER_SWING = tick()
+
+                    -- SmoothFace reacts only to an attack that is actually inside
+                    -- the real hit range. <= HIT_RANGE is intentionally angle-free,
+                    -- giving the requested 360-degree side/back response.
+                    local actuallyInRange = IsActuallyInHitRange(character, false)
+                    if actuallyInRange then
+                        TriggerSmoothFace(character)
+                    end
+
                     ScheduleAttack(character, track)
                 end
 
-                connectedKillerHumanoids[humanoid] = {}
-                connectedKillerHumanoids[humanoid].humanoid = humanoid
-                connectedKillerHumanoids[humanoid].anim = animator
-                connectedKillerHumanoids[humanoid].humanoidConn = humanoid.AnimationPlayed:Connect(onAnimation)
-                if animator then
-                    connectedKillerHumanoids[humanoid].animConn = animator.AnimationPlayed:Connect(onAnimation)
-                end
+                connectedKillerHumanoids[humanoid] = {
+                    humanoid = humanoid,
+                    anim = animator,
+                    humanoidConn = humanoid.AnimationPlayed:Connect(onAnimation),
+                    animConn = animator and animator.AnimationPlayed:Connect(onAnimation) or nil,
+                }
 
                 humanoid.AncestryChanged:Connect(function()
                     if not humanoid.Parent then
@@ -7455,34 +7496,36 @@ local function BolongHub()
                 end
             end)
 
-            RunService.RenderStepped:Connect(function(dt)
-                UpdateSmoothFace(dt)
-            end)
+            RunService.RenderStepped:Connect(UpdateSmoothFace)
 
             RunService.RenderStepped:Connect(function()
                 if not State.autoParryEnabled then
+                    StopSmoothFace()
                     return
                 end
-
                 for humanoid, entry in pairs(connectedKillerHumanoids) do
                     if not humanoid or not humanoid.Parent then
+                        if entry then
+                            pcall(function() entry.humanoidConn:Disconnect() end)
+                            pcall(function() if entry.animConn then entry.animConn:Disconnect() end end)
+                        end
                         connectedKillerHumanoids[humanoid] = nil
                     end
                 end
             end)
 
             ----------------------------------------------------------------------
-            -- PARRY RADIUS ESP (ZINKA STYLE)
-            -- Visual ring only. It does not participate in parry decisions.
-            -- The configured State.parryRadius is used as the ring radius.
+            -- PARRY RADIUS ESP
+            -- Mechanism copied from main (9).lua: 56 segments, exact segment
+            -- geometry, Y-offset, Heartbeat update and killer-state color change.
+            -- Adaptation: BolongHub's existing State.parryRadius and toggle are
+            -- retained; no other feature is touched.
             ----------------------------------------------------------------------
             local parryRadiusRingModel = Instance.new("Model")
             parryRadiusRingModel.Name = "ZINKA_ParryRing"
-
             local parryRadiusRingParts = {}
-            local parryRadiusRingSegments = 56
-            local parryRadiusRingRadius = -1
-            local parryRadiusRingTargetState = nil
+            local parryRadiusRingRadius = nil
+            local parryRadiusRingInRange = nil
 
             local function cleanupParryRadiusRing(radius)
                 for _, part in ipairs(parryRadiusRingParts) do
@@ -7490,22 +7533,30 @@ local function BolongHub()
                         part:Destroy()
                     end
                 end
-                table.clear(parryRadiusRingParts)
+                parryRadiusRingParts = {}
 
                 radius = tonumber(radius) or 14
-                local segmentLength = (2 * math.pi * radius / parryRadiusRingSegments) * 1.15
+                local segmentCount = 56
+                local segmentLength = (2 * math.pi * radius / segmentCount) * 1.15
 
-                for i = 1, parryRadiusRingSegments do
-                    local angle = (i / parryRadiusRingSegments) * math.pi * 2
-                    local position = Vector3.new(math.cos(angle) * radius, 0, math.sin(angle) * radius)
-                    local tangent = Vector3.new(-math.sin(angle), 0, math.cos(angle))
+                for i = 1, segmentCount do
+                    local angle = (i / segmentCount) * math.pi * 2
+                    local position = Vector3.new(
+                        math.cos(angle) * radius,
+                        0,
+                        math.sin(angle) * radius
+                    )
+                    local tangent = Vector3.new(
+                        -math.sin(angle),
+                        0,
+                        math.cos(angle)
+                    )
 
                     local part = Instance.new("Part")
                     part.Anchored = true
                     part.CanCollide = false
                     part.CanQuery = false
                     part.CanTouch = false
-                    part.CastShadow = false
                     part.Material = Enum.Material.Neon
                     part.Color = Color3.fromRGB(70, 130, 165)
                     part.Transparency = 0.5
@@ -7515,91 +7566,112 @@ local function BolongHub()
                     parryRadiusRingParts[i] = part
                 end
 
-                parryRadiusRingModel.WorldPivot = CFrame.new()
+                parryRadiusRingModel.WorldPivot = CFrame.new(0, 0, 0)
                 parryRadiusRingRadius = radius
             end
 
-            cleanupParryRadiusRing(State.parryRadius)
+            cleanupParryRadiusRing(tonumber(State.parryRadius) or 14)
 
-            local parryRadiusRingConnection
-
-            function fn_ParryHelper_6254(enabled)
-                if enabled then
-                    if parryRadiusRingConnection then
-                        parryRadiusRingConnection:Disconnect()
-                        parryRadiusRingConnection = nil
+            local function GetActiveKillerForRadiusESP()
+                local getter = rawget(_G, "__ZINKA_KILLERCHAR")
+                if type(getter) == "function" then
+                    local ok, character = pcall(getter)
+                    if ok and character and character.Parent then
+                        return character
                     end
-
-                    cleanupParryRadiusRing(State.parryRadius)
-
-                    parryRadiusRingConnection = RunService.Heartbeat:Connect(function()
-                        local character = LocalPlayer.Character
-                        local root = character and character:FindFirstChild("HumanoidRootPart")
-                        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-
-                        if not root or not humanoid or humanoid.Health <= 0 or (LocalPlayer.Team and LocalPlayer.Team.Name == "Killer") then
-                            if parryRadiusRingModel.Parent then
-                                parryRadiusRingModel.Parent = nil
-                            end
-                            parryRadiusRingTargetState = nil
-                            return
-                        end
-
-                        local radius = tonumber(State.parryRadius) or 14
-                        if radius ~= parryRadiusRingRadius then
-                            cleanupParryRadiusRing(radius)
-                            parryRadiusRingTargetState = nil
-                        end
-
-                        if not parryRadiusRingModel.Parent then
-                            parryRadiusRingModel.Parent = WorkspaceService
-                        end
-
-                        parryRadiusRingModel:PivotTo(CFrame.new(root.Position.X, root.Position.Y - 2.8, root.Position.Z))
-
-                        local inRange = false
-                        local nearestDistance = math.huge
-
-                        for killerCharacter, _ in pairs(State.killerCharacters) do
-                            if killerCharacter and killerCharacter.Parent then
-                                local killerRoot = killerCharacter:FindFirstChild("HumanoidRootPart")
-                                local killerHumanoid = killerCharacter:FindFirstChildOfClass("Humanoid")
-                                if killerRoot and killerHumanoid and killerHumanoid.Health > 0 then
-                                    local distance = (killerRoot.Position - root.Position).Magnitude
-                                    if distance < nearestDistance then
-                                        nearestDistance = distance
-                                    end
-                                    if distance <= radius then
-                                        inRange = true
-                                    end
-                                end
-                            end
-                        end
-
-                        if inRange == parryRadiusRingTargetState then
-                            return
-                        end
-                        parryRadiusRingTargetState = inRange
-
-                        local ringColor = inRange
-                            and Color3.fromRGB(180, 55, 70)
-                            or Color3.fromRGB(70, 130, 165)
-
-                        for _, part in ipairs(parryRadiusRingParts) do
-                            if part and part.Parent then
-                                part.Color = ringColor
-                            end
-                        end
-                    end)
-                else
-                    if parryRadiusRingConnection then
-                        parryRadiusRingConnection:Disconnect()
-                        parryRadiusRingConnection = nil
-                    end
-                    parryRadiusRingModel.Parent = nil
-                    parryRadiusRingTargetState = nil
-                    parryRadiusRingRadius = -1
                 end
+
+                -- BolongHub has no guaranteed __ZINKA_KILLERCHAR provider, so use
+                -- the closest registered killer only as a compatibility fallback.
+                local playerCharacter = LocalPlayer.Character
+                local playerRoot = playerCharacter and playerCharacter:FindFirstChild("HumanoidRootPart")
+                if not playerRoot then
+                    return nil
+                end
+
+                local nearestCharacter = nil
+                local nearestDistance = math.huge
+                for killerCharacter, entry in pairs(State.killerCharacters) do
+                    local killerRoot = killerCharacter and killerCharacter:FindFirstChild("HumanoidRootPart")
+                    local killerHumanoid = killerCharacter and killerCharacter:FindFirstChildOfClass("Humanoid")
+                    if killerRoot and killerHumanoid and killerHumanoid.Health > 0 then
+                        local distance = (killerRoot.Position - playerRoot.Position).Magnitude
+                        if distance < nearestDistance then
+                            nearestDistance = distance
+                            nearestCharacter = killerCharacter
+                        end
+                    end
+                end
+                return nearestCharacter
+            end
+
+            local parryRadiusEspConnection
+            function fn_ParryHelper_6254(enabled)
+                if parryRadiusEspConnection then
+                    parryRadiusEspConnection:Disconnect()
+                    parryRadiusEspConnection = nil
+                end
+
+                if not enabled then
+                    parryRadiusRingModel.Parent = nil
+                    parryRadiusRingInRange = nil
+                    return
+                end
+
+                local initialRadius = tonumber(State.parryRadius) or 14
+                if initialRadius ~= parryRadiusRingRadius then
+                    cleanupParryRadiusRing(initialRadius)
+                end
+
+                parryRadiusEspConnection = RunService.Heartbeat:Connect(function()
+                    local targetCharacter_p = tonumber(State.parryRadius) or 14
+                    if targetCharacter_p ~= parryRadiusRingRadius then
+                        cleanupParryRadiusRing(targetCharacter_p)
+                        parryRadiusRingInRange = nil
+                    end
+
+                    local childInstance_ba = LocalPlayer.Character
+                    local childInstance_bb = childInstance_ba and childInstance_ba:FindFirstChild("HumanoidRootPart")
+                    if (not childInstance_bb)
+                        or (LocalPlayer.Team and LocalPlayer.Team.Name == "Killer")
+                        or not State.parryRadiusEspEnabled then
+                        if parryRadiusRingModel.Parent then
+                            parryRadiusRingModel.Parent = nil
+                        end
+                        parryRadiusRingInRange = nil
+                        return
+                    end
+
+                    if not parryRadiusRingModel.Parent then
+                        parryRadiusRingModel.Parent = workspace
+                    end
+
+                    parryRadiusRingModel:PivotTo(CFrame.new(
+                        childInstance_bb.Position.X,
+                        childInstance_bb.Position.Y - 2.8,
+                        childInstance_bb.Position.Z
+                    ))
+
+                    local killerCharacter = GetActiveKillerForRadiusESP()
+                    local killerRoot = killerCharacter and killerCharacter:FindFirstChild("HumanoidRootPart")
+                    local textColor_aq = killerRoot
+                        and (killerRoot.Position - childInstance_bb.Position).Magnitude <= targetCharacter_p
+                        or false
+
+                    if textColor_aq == parryRadiusRingInRange then
+                        return
+                    end
+                    parryRadiusRingInRange = textColor_aq
+
+                    local textColor_ar = textColor_aq
+                        and Color3.fromRGB(180, 55, 70)
+                        or Color3.fromRGB(70, 130, 165)
+                    for _, textColor_cv in ipairs(parryRadiusRingParts) do
+                        if textColor_cv and textColor_cv.Parent then
+                            textColor_cv.Color = textColor_ar
+                        end
+                    end
+                end)
             end
         end
 
