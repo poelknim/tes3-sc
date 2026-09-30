@@ -150,6 +150,10 @@ local function BolongHub()
             autoParryAutoFace = true,
             autoParryFaceSmoothness = 14,
             autoParryFaceLead = 0.08,
+            -- main (9).lua: handler_fc() == (ZinkaValues.ParryMode or "Legit") == "Rage"
+            -- Rage enables the RenderStepped instant-fire poll (baris 5541-5572).
+            autoParryRageMode = true,
+            autoParryMobileButton = false,
             var_originalValue_b002  = (0.0),
             state_unhookYourself_d58e      = {},
             state_unhookYourself_c84b = {},
@@ -274,6 +278,7 @@ local function BolongHub()
             var_player_a579 = true,
             var_player_1075 = {},
             hookCounterAttrConns = {},
+            hookCounterEnabled = false,
             var_player_d43b = nil,
             var_player_ae6d = nil,
             var_player_4319 = nil,
@@ -2793,140 +2798,259 @@ local function BolongHub()
         end
 
         do
+            -- Robust "HookCount" resolver.
+            -- The old version only looked at player:GetAttribute("HookCount") and a
+            -- direct child named HookCount, so any other replication path the game
+            -- used (leaderstats, a renamed stat, an attribute on the character) made
+            -- the counter read 0 forever and render "Hooks: 0".
             local function fn_GetHelper_6fd0(player)
                 if not player then return 0 end
-                local var_success_abb9, val = pcall(function() return player.GetAttribute(player,"HookCount") end)
-                if var_success_abb9 and typeof(val) == "number" then return val end
 
-                local var_value_d1f9 = player.FindFirstChild(player,"HookCount")
-                if var_value_d1f9 and var_value_d1f9.IsA(var_value_d1f9,"ValueBase") then return tonumber(var_value_d1f9.Value) or 0 end
+                -- 1) direct attribute / NumberValue, the common case
+                pcall(function()
+                    local v = player:GetAttribute("HookCount")
+                    if typeof(v) == "number" then return v end
+                end)
+                do
+                    local ok, v = pcall(function() return player:GetAttribute("HookCount") end)
+                    if ok and typeof(v) == "number" then return v end
+                end
+                do
+                    local child = player:FindFirstChild("HookCount")
+                    if child and child:IsA("ValueBase") then
+                        return tonumber(child.Value) or 0
+                    end
+                end
+
+                -- 2) leaderstats / any folder holding a HookCount value
+                pcall(function()
+                    local stats = player:FindFirstChild("leaderstats")
+                        or player:FindFirstChild("Stats")
+                        or player:FindFirstChild("stats")
+                    if stats then
+                        local child = stats:FindFirstChild("HookCount")
+                        if child and child:IsA("ValueBase") then
+                            return tonumber(child.Value) or 0
+                        end
+                    end
+                end)
+
+                -- 3) any attribute whose name mentions "hook" and is numeric.
+                --    Covers games that name it Hooks, HooksUsed, Hook_Count, etc.
+                pcall(function()
+                    for name, value in pairs(player:GetAttributes()) do
+                        local lower = string.lower(tostring(name))
+                        if string.find(lower, "hook", 1, true) and typeof(value) == "number" then
+                            return value
+                        end
+                    end
+                end)
+
+                -- 4) same set of probes on the character model
                 local char = player.Character
                 if char then
-                    local var_playerGui_7d48, cval = pcall(function() return char.GetAttribute(char,"HookCount") end)
-                    if var_playerGui_7d48 and typeof(cval) == "number" then return cval end
-                    local var_child_cd39 = char.FindFirstChild(char,"HookCount")
-                    if var_child_cd39 and var_child_cd39.IsA(var_child_cd39,"ValueBase") then return tonumber(var_child_cd39.Value) or 0 end
+                    do
+                        local ok, v = pcall(function() return char:GetAttribute("HookCount") end)
+                        if ok and typeof(v) == "number" then return v end
+                    end
+                    do
+                        local child = char:FindFirstChild("HookCount")
+                        if child and child:IsA("ValueBase") then
+                            return tonumber(child.Value) or 0
+                        end
+                    end
+                    pcall(function()
+                        for name, value in pairs(char:GetAttributes()) do
+                            local lower = string.lower(tostring(name))
+                            if string.find(lower, "hook", 1, true) and typeof(value) == "number" then
+                                return value
+                            end
+                        end
+                    end)
                 end
+
                 return 0
             end
 
             local function fn_GetHelper_6249(enabled)
                 local var_child_9379 = LocalPlayer.FindFirstChild(LocalPlayer,"PlayerGui")
                 if not var_child_9379 then return end
-                for _, gui in ipairs(var_child_9379.GetChildren(var_child_9379)) do
-                    if gui.IsA(gui,"ScreenGui") and gui.Name.match(gui.Name,"%-mob$") then
-                        local var_child_cd9f = gui.FindFirstChild(gui,"Frame")
-                        if var_child_cd9f then
-                            for var_remoteEvent_5dde = 1, 5 do
-                                local var_originalValue_4702 = var_child_cd9f.FindFirstChild(var_child_cd9f,"Survivor" .. var_remoteEvent_5dde)
-                                local var_color_cc0e = var_originalValue_4702 and var_originalValue_4702.FindFirstChild(var_originalValue_4702,"ImageLabel")
-                                local var_unknownValue_0064_e6c8 = var_originalValue_4702 and var_originalValue_4702.FindFirstChild(var_originalValue_4702,"TextLabel")
-                                if var_color_cc0e and var_unknownValue_0064_e6c8 then
-                                    local var_label_41e8 = "Bolong_CustomHookCounter"
-                                    local var_backgroundTransparency_1d6e = var_color_cc0e.FindFirstChild(var_color_cc0e,var_label_41e8)
-                                    local var_label_3158 = var_color_cc0e.FindFirstChild(var_color_cc0e,"Counter")
 
-                                    local function fn_GetHandler_2430(cacheKey)
-                                        if var_label_3158 then pcall(function() var_label_3158.Visible = false end) end
-                                        if var_backgroundTransparency_1d6e then var_backgroundTransparency_1d6e.Visible = false end
-                                        if cacheKey then State.var_player_1075[cacheKey] = nil end
-                                    end
+                -- Slot discovery.
+                --
+                -- The old lookup was ScreenGui(-mob) > Frame > Survivor<N>, which does
+                -- not exist in this game: the real mobile roster lives under
+                -- ScreenGui > Controls > Gui-mob (same path the parry GUI fallback
+                -- and the hook/ESP helpers already use). So the counter never found
+                -- a single slot and silently did nothing.
+                --
+                -- We now search every ScreenGui recursively for Survivor1..Survivor5,
+                -- which is independent of how deeply the roster is nested.
+                local slots = {}
+                local seenSlots = {}
 
-                                    if not enabled then
-                                        fn_GetHandler_2430(nil)
-                                        continue
-                                    end
-
-
-                                    local var_player_f626 = var_unknownValue_0064_e6c8.Text and var_unknownValue_0064_e6c8.Text.match(var_unknownValue_0064_e6c8.Text,"^%s*(.-)%s*$") or ""
-                                    local fn_CutsceneHelper_76a2 = var_player_f626.lower(var_player_f626)
-                                    local var_player_f917 = (var_player_f626 == "" or fn_CutsceneHelper_76a2 == "waiting" or fn_CutsceneHelper_76a2.find(fn_CutsceneHelper_76a2,"waiting") or fn_CutsceneHelper_76a2 == "empty" or var_player_f626.match(var_player_f626,"^Survivor%d+$"))
-
-                                    local var_originalValue_f0a4 = true
-                                    pcall(function()
-                                        if var_originalValue_4702.Visible == false then var_originalValue_f0a4 = false end
-                                        if var_color_cc0e.Image == "" or var_color_cc0e.Image == "rbxasset://textures/ui/GuiImagePlaceholder.png" then
-
-                                        end
-                                    end)
-                                    if not var_originalValue_f0a4 then
-                                        fn_GetHandler_2430(nil)
-                                        continue
-                                    end
-
-                                    local player = nil
-                                    if not var_player_f917 then
-                                        for _, var_player_2e5f in ipairs(Players.GetPlayers(Players)) do
-                                            if var_player_2e5f.Name == var_player_f626 or var_player_2e5f.DisplayName == var_player_f626 then
-                                                player = var_player_2e5f
-                                                break
-                                            end
-                                        end
-                                    end
-                                    if not player then
-                                        fn_GetHandler_2430(nil)
-                                        continue
-                                    end
-
-                                    local var_label_9e07 = fn_GetHelper_6fd0(player)
-                                    State.var_player_1075[player.Name] = var_label_9e07
-
-
-                                    if var_label_9e07 <= 0 then
-                                        if var_label_3158 then pcall(function() var_label_3158.Visible = false end) end
-                                        if not var_backgroundTransparency_1d6e then
-                                            var_backgroundTransparency_1d6e = Instance.new("TextLabel")
-                                            var_backgroundTransparency_1d6e.Name = var_label_41e8
-                                            var_backgroundTransparency_1d6e.Size = UDim2.new(1, 0, 0.35, 0)
-                                            var_backgroundTransparency_1d6e.Position = UDim2.new(0, (0.0), 0.65, 0)
-                                            var_backgroundTransparency_1d6e.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
-                                            var_backgroundTransparency_1d6e.BackgroundTransparency = 0.5
-                                            var_backgroundTransparency_1d6e.TextColor3 = Color3.fromRGB(255, 255, 255)
-                                            var_backgroundTransparency_1d6e.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
-                                            var_backgroundTransparency_1d6e.TextStrokeTransparency = 0
-                                            var_backgroundTransparency_1d6e.TextScaled = true
-                                            var_backgroundTransparency_1d6e.Font = Enum.Font.SourceSansBold
-                                            var_backgroundTransparency_1d6e.BorderSizePixel = 0
-                                            var_backgroundTransparency_1d6e.Parent = var_color_cc0e
-                                        end
-                                        var_backgroundTransparency_1d6e.Visible = true
-                                        var_backgroundTransparency_1d6e.Text = "Hooks: 0"
-                                        var_backgroundTransparency_1d6e.TextColor3 = Color3.fromRGB(255, 255, 255)
-                                        continue
-                                    end
-
-
-                                    if var_label_3158 then pcall(function() var_label_3158.Visible = true end) end
-                                    if not var_backgroundTransparency_1d6e then
-                                        var_backgroundTransparency_1d6e = Instance.new("TextLabel")
-                                        var_backgroundTransparency_1d6e.Name = var_label_41e8
-                                        var_backgroundTransparency_1d6e.Size = UDim2.new(1, 0, 0.35, 0)
-                                        var_backgroundTransparency_1d6e.Position = UDim2.new(0, (0.0), 0.65, 0)
-                                        var_backgroundTransparency_1d6e.BackgroundColor3 = Color3.fromRGB(0, (0.0), 0)
-                                        var_backgroundTransparency_1d6e.BackgroundTransparency = 0.5
-                                        var_backgroundTransparency_1d6e.TextColor3 = Color3.fromRGB(255, 255, 255)
-                                        var_backgroundTransparency_1d6e.TextStrokeColor3 = Color3.fromRGB((0.0), 0, 0)
-                                        var_backgroundTransparency_1d6e.TextStrokeTransparency = 0
-                                        var_backgroundTransparency_1d6e.TextScaled = true
-                                        var_backgroundTransparency_1d6e.Font = Enum.Font.SourceSansBold
-                                        var_backgroundTransparency_1d6e.BorderSizePixel = 0
-                                        var_backgroundTransparency_1d6e.Parent = var_color_cc0e
-                                    end
-                                    var_backgroundTransparency_1d6e.Visible = true
-                                    if var_label_9e07 >= 3 then
-                                        var_backgroundTransparency_1d6e.Text = "DEAD"
-                                        var_backgroundTransparency_1d6e.TextColor3 = Color3.fromRGB(255, (75.0), 75)
-                                    elseif var_label_9e07 == 2 then
-                                        var_backgroundTransparency_1d6e.Text = "Hooks: 2"
-                                        var_backgroundTransparency_1d6e.TextColor3 = Color3.fromRGB(255, 140, 0)
-                                    else
-                                        var_backgroundTransparency_1d6e.Text = "Hooks: 1"
-                                        var_backgroundTransparency_1d6e.TextColor3 = Color3.fromRGB((210.0), (130.0), 255)
-                                    end
+                local function CollectSlots(root)
+                    local ok, descendants = pcall(function()
+                        return root:GetDescendants()
+                    end)
+                    if not (ok and type(descendants) == "table") then return end
+                    for _, inst in ipairs(descendants) do
+                        if inst:IsA("GuiObject") then
+                            local slotName = inst.Name:match("^Survivor(%d)$")
+                            if slotName then
+                                local key = tostring(inst:GetDebugId())
+                                if not seenSlots[key] then
+                                    seenSlots[key] = true
+                                    slots[#slots + 1] = inst
                                 end
                             end
                         end
                     end
+                end
+
+                for _, gui in ipairs(var_child_9379:GetChildren()) do
+                    if gui:IsA("ScreenGui") then
+                        -- Preferred path, kept first so ordering is stable.
+                        local controls = gui:FindFirstChild("Controls")
+                        if controls then
+                            CollectSlots(controls)
+                        end
+                        -- Then anywhere else under this ScreenGui.
+                        CollectSlots(gui)
+                    end
+                end
+
+                if #slots == 0 then
+                    return
+                end
+
+                -- Group by slot so the painter stays readable.
+                local function PaintSlot(slot)
+                    local label = "Bolong_CustomHookCounter"
+
+                    local nameLabel = nil
+                    pcall(function()
+                        for _, inst in ipairs(slot:GetDescendants()) do
+                            if inst:IsA("TextLabel") and inst.Name ~= label then
+                                nameLabel = inst
+                                break
+                            end
+                        end
+                    end)
+
+                    local counter = slot:FindFirstChild(label, true)
+
+                    local function Hide()
+                        if counter then pcall(function() counter.Visible = false end) end
+                        if nameLabel then State.var_player_1075[nameLabel.Text] = nil end
+                    end
+
+                    if not enabled then
+                        Hide()
+                        return
+                    end
+
+                    if not nameLabel then
+                        Hide()
+                        return
+                    end
+
+                    local visible = true
+                    pcall(function()
+                        visible = (not slot:IsA("GuiObject")) or slot.Visible
+                    end)
+                    if not visible then
+                        Hide()
+                        return
+                    end
+
+                    local rawName = nameLabel.Text or ""
+                    local display = rawName:match("^%s*(.-)%s*$") or ""
+                    local lower = display:lower()
+
+                    local placeholder =
+                        display == ""
+                        or lower == "waiting"
+                        or lower:find("waiting", 1, true) ~= nil
+                        or lower == "empty"
+                        or lower:find("none", 1, true) ~= nil
+                        or display:match("^Survivor%d+$") ~= nil
+
+                    local player = nil
+                    if not placeholder then
+                        for _, candidate in ipairs(Players:GetPlayers()) do
+                            if candidate.Name == display or candidate.DisplayName == display then
+                                player = candidate
+                                break
+                            end
+                        end
+                        if not player then
+                            -- Second chance: the label may show the name with a tag
+                            -- or a colour prefix, so fall back to a substring match.
+                            for _, candidate in ipairs(Players:GetPlayers()) do
+                                if display ~= ""
+                                    and (candidate.Name:lower():find(lower, 1, true)
+                                        or candidate.DisplayName:lower():find(lower, 1, true)) then
+                                    player = candidate
+                                    break
+                                end
+                            end
+                        end
+                    end
+
+                    if not player then
+                        Hide()
+                        return
+                    end
+
+                    local hooks = fn_GetHelper_6fd0(player)
+                    State.var_player_1075[player.Name] = hooks
+
+                    -- Make sure the original game counter never fights ours.
+                    local stockCounter = slot:FindFirstChild("Counter", true)
+                    if stockCounter then
+                        pcall(function() stockCounter.Visible = false end)
+                    end
+
+                    if not counter then
+                        counter = Instance.new("TextLabel")
+                        counter.Name = label
+                        counter.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+                        counter.BackgroundTransparency = 0.45
+                        counter.BorderSizePixel = 0
+                        counter.Font = Enum.Font.SourceSansBold
+                        counter.TextColor3 = Color3.fromRGB(255, 255, 255)
+                        counter.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+                        counter.TextStrokeTransparency = 0
+                        counter.TextScaled = true
+                        -- Absolute, anchored to the bottom of the slot so it lands
+                        -- in the same place no matter how the roster is nested.
+                        counter.AnchorPoint = Vector2.new(0, 1)
+                        counter.Position = UDim2.new(0, 0, 1, 0)
+                        counter.Size = UDim2.new(1, 0, 0, 18)
+                        counter.ZIndex = 50
+                        counter.Parent = slot
+                    end
+
+                    counter.Visible = true
+
+                    if hooks >= 3 then
+                        counter.Text = "DEAD"
+                        counter.TextColor3 = Color3.fromRGB(255, 75, 75)
+                    elseif hooks == 2 then
+                        counter.Text = "Hooks: 2"
+                        counter.TextColor3 = Color3.fromRGB(255, 140, 0)
+                    elseif hooks == 1 then
+                        counter.Text = "Hooks: 1"
+                        counter.TextColor3 = Color3.fromRGB(210, 130, 255)
+                    else
+                        counter.Text = "Hooks: 0"
+                        counter.TextColor3 = Color3.fromRGB(255, 255, 255)
+                    end
+                end
+
+                for _, slot in ipairs(slots) do
+                    pcall(PaintSlot, slot)
                 end
             end
 
@@ -2958,7 +3082,7 @@ local function BolongHub()
 
                 pcall(function()
                     player.CharacterAdded.Connect(player.CharacterAdded,function(char)
-                        if not Config.cfg_antiFlashlightBlind_774e then return end
+                        if not State.hookCounterEnabled then return end
                         task.wait(0.5)
                         pcall(function()
                             local var_connection_ea4a = char:GetAttributeChangedSignal("HookCount"):Connect(function()
@@ -2992,6 +3116,7 @@ local function BolongHub()
             end
 
             local function fn_GetHelper_fcc7()
+                State.hookCounterEnabled = true
                 if State.var_player_d43b then return end
                 State.var_player_a579 = true
 
@@ -3020,19 +3145,24 @@ local function BolongHub()
                 local var_descendant_5584 = LocalPlayer.FindFirstChild(LocalPlayer,"PlayerGui")
                 if var_descendant_5584 then
                     State.var_player_d43b = var_descendant_5584.ChildAdded.Connect(var_descendant_5584.ChildAdded,function(var_instance_4e7f)
-                        if var_instance_4e7f.IsA(var_instance_4e7f,"ScreenGui") and var_instance_4e7f.Name.match(var_instance_4e7f.Name,"%-mob$") then
-                            State.var_player_a579 = true
-                        end
-
-                        if var_instance_4e7f.Name == "Frame" and var_instance_4e7f.Parent and var_instance_4e7f.Parent.Name.match(var_instance_4e7f.Parent.Name,"%-mob$") then
+                        if var_instance_4e7f:IsA("ScreenGui") then
                             State.var_player_a579 = true
                         end
                     end)
 
                     local var_descendant_d8c0 = var_descendant_5584.DescendantAdded.Connect(var_descendant_5584.DescendantAdded,function(var_descendant_fe40)
-                        if var_descendant_fe40.Name == "Survivor1" or var_descendant_fe40.Name == "ImageLabel" then
-                            local var_descendant_728a = var_descendant_fe40.FindFirstAncestorOfClass(var_descendant_fe40,"ScreenGui")
-                            if var_descendant_728a and var_descendant_728a.Name.match(var_descendant_728a.Name,"%-mob$") then
+                        -- Any roster slot or any ScreenGui appearing means the GUI is
+                        -- (re)building, so mark dirty and let the 0.5s redraw pick it up.
+                        local nm = var_descendant_fe40.Name
+                        if nm:match("^Survivor%d+$") or var_descendant_fe40:IsA("ScreenGui") then
+                            State.var_player_a579 = true
+                            return
+                        end
+                        if var_descendant_fe40:IsA("TextLabel") or var_descendant_fe40:IsA("ImageLabel") then
+                            local ok, anc = pcall(function()
+                                return var_descendant_fe40:FindFirstAncestorOfClass("ScreenGui")
+                            end)
+                            if ok and anc then
                                 State.var_player_a579 = true
                             end
                         end
@@ -3044,23 +3174,25 @@ local function BolongHub()
             end
 
             local function fn_ServerHandler_4ad1()
+                State.hookCounterEnabled = false
                 fn_GetHandler_2300()
                 State.var_player_1075 = {}
                 State.var_player_a579 = true
                 fn_GetHelper_6249(false)
 
+                -- Destroy every counter we created, wherever it ended up. The old
+                -- teardown walked ScreenGui(-mob) > Frame > SurvivorN > ImageLabel,
+                -- which is the same broken path as the painter, so disabling left
+                -- the labels on screen.
                 local var_child_9379 = LocalPlayer.FindFirstChild(LocalPlayer,"PlayerGui")
                 if var_child_9379 then
-                    for _, gui in ipairs(var_child_9379.GetChildren(var_child_9379)) do
-                        if gui.IsA(gui,"ScreenGui") and gui.Name.match(gui.Name,"%-mob$") then
-                            local var_child_cd9f = gui.FindFirstChild(gui,"Frame")
-                            if var_child_cd9f then
-                                for var_remoteEvent_5dde = (1.0), (5.0) do
-                                    local var_originalValue_4702 = var_child_cd9f.FindFirstChild(var_child_cd9f,"Survivor" .. var_remoteEvent_5dde)
-                                    local var_color_cc0e = var_originalValue_4702 and var_originalValue_4702.FindFirstChild(var_originalValue_4702,"ImageLabel")
-                                    local var_backgroundTransparency_1d6e = var_color_cc0e and var_color_cc0e.FindFirstChild(var_color_cc0e,"Bolong_CustomHookCounter")
-                                    if var_backgroundTransparency_1d6e then pcall(function() var_backgroundTransparency_1d6e.Destroy(var_backgroundTransparency_1d6e) end) end
-                                end
+                    local ok, descendants = pcall(function()
+                        return var_child_9379:GetDescendants()
+                    end)
+                    if ok and type(descendants) == "table" then
+                        for _, inst in ipairs(descendants) do
+                            if inst:IsA("GuiObject") and inst.Name == "Bolong_CustomHookCounter" then
+                                pcall(function() inst:Destroy() end)
                             end
                         end
                     end
@@ -3068,17 +3200,25 @@ local function BolongHub()
             end
 
             RegisterTask("HookCounter", 0.5, function()
-                if not Config.cfg_antiFlashlightBlind_774e then return end
-                if not State.var_player_a579 then
+                -- Gated on the feature's own flag. The old gate read
+                -- Config.cfg_antiFlashlightBlind_774e, which only ever changes if
+                -- something else touched it, and the CharacterAdded hook inside
+                -- fn_GetHelper_886c had the same dependency -- so the redraw loop
+                -- could silently stop even with the toggle showing as ON.
+                if not State.hookCounterEnabled then return end
 
+                if not State.var_player_a579 then
                     local var_player_f83c = false
                     for _, var_player_2e5f in ipairs(Players.GetPlayers(Players)) do
                         local cur = fn_GetHelper_6fd0(var_player_2e5f)
-                        if State.var_player_1075[var_player_2e5f.Name] ~= cur then var_player_f83c = true break end
+                        if State.var_player_1075[var_player_2e5f.Name] ~= cur then
+                            var_player_f83c = true
+                            break
+                        end
                     end
                     if not var_player_f83c then return end
-                    State.var_player_a579 = true
                 end
+
                 State.var_player_a579 = false
                 fn_GetHelper_6249(true)
             end)
@@ -3086,7 +3226,8 @@ local function BolongHub()
 
             _G.Bolong_SetShowHookCounter = function(enabled)
                 Config.cfg_antiFlashlightBlind_774e = enabled and true or false
-                if Config.cfg_antiFlashlightBlind_774e then
+                State.hookCounterEnabled = Config.cfg_antiFlashlightBlind_774e
+                if State.hookCounterEnabled then
                     fn_GetHelper_fcc7()
                 else
                     fn_ServerHandler_4ad1()
@@ -6857,6 +6998,172 @@ local function BolongHub()
         local fn_ParryHelper_6254
         do
             ----------------------------------------------------------------------
+            -- AUTO PARRY TOGGLE (PC keybind + mobile GUI button)
+            --
+            -- Both entry points route through ToggleAutoParry so the shared state
+            -- reset and the on-screen indicator can never drift apart from
+            -- State.autoParryEnabled.
+            ----------------------------------------------------------------------
+            local ToggleAutoParry
+            local PaintAutoParryButton
+            local RefreshAutoParryButton
+            local CreateAutoParryButton
+
+            local autoParryButtonGui = nil
+            local autoParryButtonImage = nil
+
+            -- Visual state of the mobile button: green when parry is armed,
+            -- dim grey when off.
+            PaintAutoParryButton = function()
+                if not autoParryButtonImage then return end
+                pcall(function()
+                    autoParryButtonImage.ImageTransparency = State.autoParryEnabled and 0.1 or 0.65
+                    autoParryButtonImage.ImageColor3 = State.autoParryEnabled
+                        and Color3.fromRGB(120, 255, 140)
+                        or Color3.fromRGB(190, 190, 190)
+                end)
+            end
+
+            ToggleAutoParry = function()
+                State.autoParryEnabled = not State.autoParryEnabled
+                if not State.autoParryEnabled then
+                    -- Same cleanup the Auto Parry menu toggle does.
+                    State.state_unhookYourself_bfd8 = {}
+                    State.state_unhookYourself_d58e = {}
+                    State.state_unhookYourself_c84b = {}
+                    pcall(function()
+                        local character = LocalPlayer.Character
+                        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+                        if humanoid then humanoid.AutoRotate = true end
+                    end)
+                end
+                RefreshAutoParryButton()
+                if State.autoParryDebug then
+                    Notify("Auto Parry", State.autoParryEnabled and "ENABLED" or "DISABLED", 2)
+                end
+                return State.autoParryEnabled
+            end
+            State.ToggleAutoParry = ToggleAutoParry
+            State.PaintAutoParryButton = PaintAutoParryButton
+
+            RefreshAutoParryButton = function()
+                if not State.autoParryMobileButton then
+                    if autoParryButtonGui then
+                        autoParryButtonGui:Destroy()
+                        autoParryButtonGui = nil
+                        autoParryButtonImage = nil
+                    end
+                    return
+                end
+                if autoParryButtonGui then
+                    PaintAutoParryButton()
+                    return
+                end
+                CreateAutoParryButton()
+            end
+            State.RefreshAutoParryButton = RefreshAutoParryButton
+
+            CreateAutoParryButton = function()
+                if autoParryButtonGui then return true end
+
+                local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+                if not playerGui then
+                    -- PlayerGui can arrive late; retry a few times before giving up.
+                    task.spawn(function()
+                        for _ = 1, 20 do
+                            task.wait(0.5)
+                            if not State.autoParryMobileButton then return end
+                            if CreateAutoParryButton() then return end
+                        end
+                    end)
+                    return false
+                end
+
+                -- Anchor next to the survivor crouch button when it exists, so the
+                -- toggle sits where a mobile player already expects their controls.
+                local anchorPos = UDim2.new(1, -150, 1, -150)
+                pcall(function()
+                    local mob = playerGui:FindFirstChild("Survivor-mob")
+                    local controls = mob and mob:FindFirstChild("Controls")
+                    local crouch = controls and controls:FindFirstChild("crouch")
+                    if crouch and crouch:IsA("GuiButton") then
+                        anchorPos = UDim2.new(
+                            crouch.Position.X.Scale,
+                            crouch.Position.X.Offset + 100,
+                            crouch.Position.Y.Scale,
+                            crouch.Position.Y.Offset
+                        )
+                    end
+                end)
+
+                local gui = Instance.new("ScreenGui")
+                gui.Name = "BolongHubAutoParryToggle"
+                gui.ResetOnSpawn = false
+                gui.IgnoreGuiInset = true
+                gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+                gui.Parent = playerGui
+
+                local button = Instance.new("ImageButton")
+                button.Name = "AutoParryToggleBtn"
+                button.BackgroundTransparency = 1
+                button.BorderSizePixel = 0
+                button.AutoButtonColor = false
+                button.Size = UDim2.fromOffset(76, 76)
+                -- Same icon as the GenBoost button so the set looks consistent.
+                button.Image = "rbxassetid://129980991442403"
+                button.AnchorPoint = Vector2.new(1, 0.5)
+                button.Position = anchorPos
+                button.Draggable = false
+                button.ZIndex = 60
+                button.Parent = gui
+
+                local caption = Instance.new("TextLabel")
+                caption.Name = "Caption"
+                caption.BackgroundTransparency = 1
+                caption.BorderSizePixel = 0
+                caption.Size = UDim2.fromOffset(76, 16)
+                caption.Position = UDim2.fromOffset(0, 60)
+                caption.Font = Enum.Font.SourceSansBold
+                caption.TextScaled = true
+                caption.TextColor3 = Color3.fromRGB(255, 255, 255)
+                caption.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+                caption.TextStrokeTransparency = 0
+                caption.Text = "AP"
+                caption.ZIndex = 60
+                caption.Parent = button
+
+                -- MouseButton1Click fires for touch as well as mouse, so one
+                -- handler covers both platforms.
+                button.MouseButton1Click:Connect(function()
+                    ToggleAutoParry()
+                    button.ImageColor3 = State.autoParryEnabled
+                        and Color3.fromRGB(120, 255, 140)
+                        or Color3.fromRGB(255, 90, 90)
+                    task.delay(0.25, PaintAutoParryButton)
+                end)
+
+                autoParryButtonGui = gui
+                autoParryButtonImage = button
+                PaintAutoParryButton()
+                return true
+            end
+            State.CreateAutoParryButton = CreateAutoParryButton
+
+            -- The game's mobile GUI is rebuilt on role change / respawn, and our
+            -- ScreenGui lives outside it, so re-assert the button periodically.
+            -- Cheap: only touches PlayerGui when the toggle is on.
+            RegisterTask("AutoParryButton", 2.0, function()
+                if not State.autoParryMobileButton then return end
+                if autoParryButtonGui and autoParryButtonGui.Parent then
+                    PaintAutoParryButton()
+                    return
+                end
+                autoParryButtonGui = nil
+                autoParryButtonImage = nil
+                CreateAutoParryButton()
+            end)
+
+            ----------------------------------------------------------------------
             -- AUTO PARRY V4
             -- Reference engine derived from the working ZINKA parry mechanism.
             -- Key behavior:
@@ -6997,27 +7304,27 @@ local function BolongHub()
                 return math.clamp(value, 0.0, AUTO_PARRY_PING_MAX)
             end
 
-            -- Force-clear the game's own parry cooldown state, mirroring
-            -- main (9).lua Rage mode's __ZINKA_NOPARRYCD.
-            local function ForceResetParryCooldown()
-                local controller = FindParryController(false)
-                if not controller then
-                    return
+            -- main (9).lua handler_fk(): the gate that decides whether the game is
+            -- still on parry cooldown. Rage mode still honours this (it only
+            -- shortens the lock to 0.5s); forcing it off is the separate opt-in
+            -- NoParryCD flag, not part of Rage.
+            local function IsParryOnCooldown()
+                if tick() < lastParryAt then
+                    return true
                 end
-                pcall(function()
-                    if rawget(controller, "isParryOnCooldown") then
-                        controller.isParryOnCooldown = false
+                if tick() - lastParryAt < AUTO_PARRY_RAGE_COOLDOWN then
+                    return true
+                end
+                local controller = FindParryController(false)
+                if controller then
+                    if rawget(controller, "isParryOnCooldown") == true then
+                        return true
                     end
-                    if rawget(controller, "isParryResolving") then
-                        controller.isParryResolving = false
+                    if rawget(controller, "isParryResolving") == true then
+                        return true
                     end
-                    if type(rawget(controller, "cooldownToken")) == "number" then
-                        controller.cooldownToken = controller.cooldownToken + 1
-                    end
-                    if type(rawget(controller, "_refreshVisual")) == "function" then
-                        controller:_refreshVisual()
-                    end
-                end)
+                end
+                return false
             end
 
             local function CanExecuteParry()
@@ -7027,6 +7334,9 @@ local function BolongHub()
 
                 local now = tick()
                 if now - lastParryAt < AUTO_PARRY_EXECUTION_LOCK then
+                    return false
+                end
+                if IsParryOnCooldown() then
                     return false
                 end
 
@@ -7051,15 +7361,12 @@ local function BolongHub()
             end
 
             local function FireParry()
-                -- Force-clear the game cooldown BEFORE the can-execute check, so
-                -- isParryOnCooldown/isParryResolving never block us.
-                ForceResetParryCooldown()
-
                 if not CanExecuteParry() then
                     if State.autoParryDebug then
                         local reason = "unknown"
                         if not State.autoParryEnabled then reason = "disabled"
                         elseif tick() - lastParryAt < AUTO_PARRY_EXECUTION_LOCK then reason = "exec lock"
+                        elseif IsParryOnCooldown() then reason = "on cooldown"
                         elseif LocalPlayer:GetAttribute("EquippedItem") ~= "Parrying Dagger" then reason = "no dagger equipped"
                         elseif LocalPlayer:GetAttribute("IsDead") then reason = "dead"
                         else
@@ -7404,20 +7711,18 @@ local function BolongHub()
             --      entirely while knocked / carried / hooked / seated, so the
             --      survivor never fights the killer's own carry transform.
             ----------------------------------------------------------------------
-            local SMOOTH_FACE_WINDOW = 0.30
-            local SMOOTH_FACE_MAX_WINDOW = 0.60
             local SMOOTH_FACE_MIN_ERROR_DEG = 2
-            local SMOOTH_FACE_MAX_TURN_RATE = 1080
-            local SMOOTH_FACE_MAX_WINDOW_TURN = 200
-            local SMOOTH_FACE_SMOOTHNESS_REF = 14
+            -- One-shot "patah" snap cooldown. This is NOT a hold window: nothing
+            -- keeps control of the character after the snap.
+            local SMOOTH_FACE_SNAP_COOLDOWN = 0.25
+            -- Re-snap only if the killer has moved far off our facing.
+            local SMOOTH_FACE_RESNAP_ERROR_DEG = 18
 
             local smoothFacePreviousAutoRotate = true
             local smoothFaceAppliedHumanoid = nil
             local smoothFaceWasApplied = false
             local smoothFaceTargetCharacter = nil
             local smoothFaceWindowUntil = 0
-            local smoothFaceWindowTurnBudget = 0
-            local smoothFaceSnapPending = false
 
             local function SmoothFaceRestoreAutoRotate()
                 if not smoothFaceWasApplied then
@@ -7447,81 +7752,60 @@ local function BolongHub()
 
                 local now = tick()
                 if now < smoothFaceWindowUntil and smoothFaceTargetCharacter == killerCharacter then
-                    -- Same swing already armed: do not refresh the turn budget,
-                    -- otherwise a duplicated event could re-open an endless spin.
+                    -- Same swing already snapped. A duplicated AnimationPlayed /
+                    -- Heartbeat re-arm must not re-rotate the survivor.
                     return
                 end
 
-                -- Keep the window open until the strike the parry actually
-                -- reacts to, so a long wind-up still gets a full reaction
-                -- instead of expiring halfway through the animation.
-                -- The anti-spin guarantee comes from the per window angle
-                -- budget below, which is independent of window duration.
-                local window = SMOOTH_FACE_WINDOW
-                local length = tonumber(track and track.Length) or 0
-                if length > 0.05 then
-                    local hitAt = math.clamp(length * AUTO_PARRY_HIT_AT, 0, SMOOTH_FACE_MAX_WINDOW - 0.10)
-                    window = math.clamp(hitAt + 0.10, SMOOTH_FACE_WINDOW, SMOOTH_FACE_MAX_WINDOW)
-                end
-
                 smoothFaceTargetCharacter = killerCharacter
-                smoothFaceWindowUntil = now + window
-                smoothFaceWindowTurnBudget = SMOOTH_FACE_MAX_WINDOW_TURN
-                smoothFaceSnapPending = true
+                smoothFaceWindowUntil = now + SMOOTH_FACE_SNAP_COOLDOWN
 
-                -- Immediately face the killer RIGHT NOW instead of waiting for the
-                -- next RenderStepped frame. This saves one frame of latency
-                -- (~16ms) and ensures the character is already facing the attacker
-                -- by the time ScheduleAttack runs.
+                -- "Patah" reaction: one single instant snap to the attacker, then
+                -- immediate hand-back of control. The previous implementation held
+                -- AutoRotate = false and rewrote root.CFrame every frame for up to
+                -- 0.6s; that fight with the game's own movement system is what made
+                -- the survivor look frozen both after a successful parry and while
+                -- being hit. We now touch the transform exactly once.
+                SmoothFaceRestoreAutoRotate()
+
                 local myChar = LocalPlayer.Character
                 local myHumanoid = myChar and myChar:FindFirstChildOfClass("Humanoid")
                 local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
                 local killerRoot = killerCharacter:FindFirstChild("HumanoidRootPart")
-                if myRoot and killerRoot and myHumanoid and myHumanoid.Health > 0
-                    and not SmoothFaceRotationLocked(myChar, myHumanoid, myRoot, killerCharacter) then
-                    -- Capture & disable AutoRotate
-                    if not smoothFaceWasApplied then
-                        smoothFacePreviousAutoRotate = myHumanoid.AutoRotate
-                        smoothFaceAppliedHumanoid = myHumanoid
-                        smoothFaceWasApplied = true
-                    end
-                    pcall(function() myHumanoid.AutoRotate = false end)
+                if not (myRoot and killerRoot and myHumanoid) then
+                    return
+                end
+                if SmoothFaceRotationLocked(myChar, myHumanoid, myRoot, killerCharacter) then
+                    return
+                end
 
-                    local lead = math.clamp(tonumber(State.autoParryFaceLead) or 0.08, 0, 0.20)
-                    local tv = killerRoot.AssemblyLinearVelocity
-                    local aimX = killerRoot.Position.X + tv.X * lead
-                    local aimZ = killerRoot.Position.Z + tv.Z * lead
-                    local dx = aimX - myRoot.Position.X
-                    local dz = aimZ - myRoot.Position.Z
-                    if (dx * dx + dz * dz) > 0.0025 then
-                        local look = myRoot.CFrame.LookVector
-                        local curYaw = math.atan2(look.X, look.Z)
-                        local desYaw = math.atan2(dx, dz)
-                        local yawErr = (desYaw - curYaw + math.pi) % (math.pi * 2) - math.pi
-                        if math.abs(yawErr) >= math.rad(SMOOTH_FACE_MIN_ERROR_DEG) then
-                            pcall(function()
-                                myRoot.CFrame = myRoot.CFrame * CFrame.Angles(0, yawErr, 0)
-                            end)
-                        end
-                    end
-                    -- Mark the snap as consumed so RenderStepped doesn't double-snap
-                    smoothFaceSnapPending = false
+                local lead = math.clamp(tonumber(State.autoParryFaceLead) or 0.08, 0, 0.20)
+                local tv = killerRoot.AssemblyLinearVelocity
+                local aimX = killerRoot.Position.X + tv.X * lead
+                local aimZ = killerRoot.Position.Z + tv.Z * lead
+                local dx = aimX - myRoot.Position.X
+                local dz = aimZ - myRoot.Position.Z
+                if (dx * dx + dz * dz) <= 0.0025 then
+                    return
                 end
-            end
 
-            local function SmoothFaceTarget()
-                local killerCharacter = smoothFaceTargetCharacter
-                if not killerCharacter or not killerCharacter.Parent then
-                    return nil
+                local look = myRoot.CFrame.LookVector
+                local curYaw = math.atan2(look.X, look.Z)
+                local desYaw = math.atan2(dx, dz)
+                -- Shortest-path wrap to +/-180 deg: lands exactly on the attacker
+                -- and can never degenerate into a 360 spin.
+                local yawErr = (desYaw - curYaw + math.pi) % (math.pi * 2) - math.pi
+                if math.abs(yawErr) < math.rad(SMOOTH_FACE_MIN_ERROR_DEG) then
+                    return
                 end
-                if tick() > smoothFaceWindowUntil then
-                    return nil
-                end
-                local killerHumanoid = killerCharacter:FindFirstChildOfClass("Humanoid")
-                if not killerHumanoid or killerHumanoid.Health <= 0 then
-                    return nil
-                end
-                return killerCharacter
+
+                pcall(function()
+                    myRoot.CFrame = myRoot.CFrame * CFrame.Angles(0, yawErr, 0)
+                end)
+
+                -- Nothing is held open: AutoRotate was never disabled and no
+                -- per-frame loop keeps writing the transform, so the survivor is
+                -- fully controllable again on the very next physics step.
             end
 
             -- True whenever the local survivor's transform is owned by the game
@@ -7589,101 +7873,27 @@ local function BolongHub()
                 return false
             end
 
-            local function UpdateSmoothFace(dt)
-                if not State.autoParryEnabled or not State.autoParryAutoFace then
-                    smoothFaceWindowUntil = 0
-                    SmoothFaceRestoreAutoRotate()
-                    return
+            local function UpdateSmoothFace(_dt)
+                -- Safety net only.
+                --
+                -- The facing reaction is a single instantaneous snap performed in
+                -- SmoothFaceArm, and it never disables AutoRotate. So there is
+                -- nothing to track here any more.
+                --
+                -- The previous version kept this as a per-frame rotation loop for
+                -- up to 0.6s with AutoRotate forced off. That wrote root.CFrame on
+                -- every frame while the game's own movement code was also writing
+                -- it, which is what produced the visible "freeze" -- both right
+                -- after a successful parry and while being hit, since the killer
+                -- keeps the attack animation playing in both cases.
+                --
+                -- All this does now is guarantee AutoRotate is never left disabled,
+                -- including on respawn, and drop stale snap state.
+                SmoothFaceRestoreAutoRotate()
+
+                if tick() > smoothFaceWindowUntil then
+                    smoothFaceTargetCharacter = nil
                 end
-                if LocalPlayer.Team and LocalPlayer.Team.Name == "Killer" then
-                    smoothFaceWindowUntil = 0
-                    SmoothFaceRestoreAutoRotate()
-                    return
-                end
-
-                local character = LocalPlayer.Character
-                local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-                local root = character and character:FindFirstChild("HumanoidRootPart")
-
-                local targetCharacter = SmoothFaceTarget()
-                local targetRoot = targetCharacter and targetCharacter:FindFirstChild("HumanoidRootPart")
-
-                if (not humanoid) or (not root) or (not targetRoot)
-                    or SmoothFaceRotationLocked(character, humanoid, root, targetCharacter) then
-                    smoothFaceWindowUntil = 0
-                    SmoothFaceRestoreAutoRotate()
-                    return
-                end
-
-                if not smoothFaceWasApplied then
-                    smoothFacePreviousAutoRotate = humanoid.AutoRotate
-                    smoothFaceAppliedHumanoid = humanoid
-                    smoothFaceWasApplied = true
-                end
-                pcall(function() humanoid.AutoRotate = false end)
-
-                local lead = math.clamp(tonumber(State.autoParryFaceLead) or 0.08, 0, 0.20)
-                local targetVelocity = targetRoot.AssemblyLinearVelocity
-                local aimX = targetRoot.Position.X + targetVelocity.X * lead
-                local aimZ = targetRoot.Position.Z + targetVelocity.Z * lead
-
-                local deltaX = aimX - root.Position.X
-                local deltaZ = aimZ - root.Position.Z
-                if (deltaX * deltaX + deltaZ * deltaZ) <= 0.0025 then
-                    return
-                end
-
-                local look = root.CFrame.LookVector
-                local currentYaw = math.atan2(look.X, look.Z)
-                local desiredYaw = math.atan2(deltaX, deltaZ)
-                local yawError = (desiredYaw - currentYaw + math.pi) % (math.pi * 2) - math.pi
-
-                if math.abs(yawError) < math.rad(SMOOTH_FACE_MIN_ERROR_DEG) then
-                    return
-                end
-
-                -- "Seketika" reaction: on the first frame of the swing the survivor
-                -- turns straight to the attack source. yawError is already
-                -- shortest-path wrapped to +/-180 deg, so this lands exactly on the
-                -- attacker and can never degenerate into a 360 spin.
-                local step = yawError
-                if not smoothFaceSnapPending then
-                    -- After the snap, keep tracking the attacker under the
-                    -- "Face Smoothness" rate cap so a long wind-up still follows
-                    -- the killer, without ever spinning.
-                    local smoothness = math.clamp(
-                        tonumber(State.autoParryFaceSmoothness) or SMOOTH_FACE_SMOOTHNESS_REF,
-                        2, 30)
-                    local maxRate = math.clamp(
-                        SMOOTH_FACE_MAX_TURN_RATE * (smoothness / SMOOTH_FACE_SMOOTHNESS_REF),
-                        180, 1440)
-                    local rateStep = math.rad(maxRate) * math.clamp(dt or 0, 0, 0.1)
-                    if math.abs(step) > rateStep then
-                        step = rateStep * (step >= 0 and 1 or -1)
-                    end
-
-                    -- Hard budget per reaction window: the sustained tracking phase
-                    -- can never turn the survivor further than
-                    -- SMOOTH_FACE_MAX_WINDOW_TURN degrees, no matter how long the
-                    -- window stays open.
-                    if math.abs(step) > smoothFaceWindowTurnBudget then
-                        step = (step > 0 and 1 or -1) * math.max(0, smoothFaceWindowTurnBudget)
-                    end
-                    smoothFaceWindowTurnBudget = smoothFaceWindowTurnBudget - math.abs(step)
-                end
-
-                if math.abs(step) > 0 then
-                    pcall(function()
-                        root.CFrame = root.CFrame * CFrame.Angles(0, step, 0)
-                    end)
-                end
-
-                if not smoothFaceSnapPending and smoothFaceWindowTurnBudget <= 0 then
-                    smoothFaceWindowUntil = 0
-                    SmoothFaceRestoreAutoRotate()
-                end
-
-                smoothFaceSnapPending = false
             end
 
 
@@ -7771,7 +7981,107 @@ local function BolongHub()
                 UpdateSmoothFace(dt)
             end)
 
+            ----------------------------------------------------------------------
+            -- PARRY POLL LOOPS -- ported from main (9).lua
+            --
+            -- main (9).lua has THREE independent parry entry points. The original
+            -- port only had the AnimationPlayed -> ScheduleAttack path, which is
+            -- a single one-shot delayed call: if that one task.delay callback
+            -- fails (out of range, cooldown, character moved, character died),
+            -- the entire swing is lost. That is why the rage path in main (9)
+            -- actually parries while our rewrite never did.
+            --
+            --   1) AnimationPlayed -> handler_fr  (lines 5507-5521)  [we have]
+            --   2) RenderStepped  -> handler_fn  (lines 5541-5572)  [RAGE ONLY]
+            --      Fires INSTANTLY as soon as an attack track with
+            --      TimePosition < 0.35 is seen. No remaining/ping/window math.
+            --   3) Heartbeat     -> handler_fr  (lines 5574-5621)
+            --      Re-arms the scheduled path every 0.15s while an attack
+            --      track is still early in its timeline.
+            ----------------------------------------------------------------------
+
+            -- main (9).lua line 5564 / 5612: only consider attack tracks that are
+            -- still early in their timeline.
+            local AUTO_PARRY_TRACK_WINDOW = 0.35
+
+            -- main (9).lua line 5613: heartbeat re-arm throttle.
+            local autoParryHeartbeatLast = 0
+
+            -- Forward declaration: the real FindKillerModel body lives further
+            -- down with the Radius ESP block, but the parry poll loops below
+            -- need to call it from their closures.
+            local FindKillerModel
+
+            local function GetAttackingTrack(killerCharacter)
+                if not killerCharacter then
+                    return nil
+                end
+                local killerHumanoid = killerCharacter:FindFirstChildOfClass("Humanoid")
+                local animator = killerHumanoid and killerHumanoid:FindFirstChildOfClass("Animator")
+                if not animator then
+                    return nil
+                end
+                local ok, tracks = pcall(function()
+                    return animator:GetPlayingAnimationTracks()
+                end)
+                if not (ok and type(tracks) == "table") then
+                    return nil
+                end
+                for _, track in ipairs(tracks) do
+                    if IsAttackTrack(track) and (tonumber(track.TimePosition) or 99) < AUTO_PARRY_TRACK_WINDOW then
+                        return track
+                    end
+                end
+                return nil
+            end
+
+            -- PATH 2: main (9).lua lines 5541-5572. Rage-only instant fire.
             RunService.RenderStepped:Connect(function()
+                if not (State.autoParryEnabled and State.autoParryRageMode) then
+                    return
+                end
+
+                local killerCharacter = FindKillerModel()
+                if not killerCharacter then
+                    return
+                end
+
+                -- main (9).lua line 5551: findChild08(killer) > ParryRadius + 3
+                local distance = GetDistanceToKiller(killerCharacter)
+                local rageRadius = (tonumber(State.parryRadius) or 14) + AUTO_PARRY_DETECT_PADDING
+                if distance > rageRadius then
+                    return
+                end
+
+                local track = GetAttackingTrack(killerCharacter)
+                if not track then
+                    return
+                end
+
+                -- main (9).lua line 5565: findChild11 = killer faces player + LOS
+                local killerRoot = killerCharacter:FindFirstChild("HumanoidRootPart")
+                local playerCharacter = LocalPlayer.Character
+                local playerRoot = playerCharacter and playerCharacter:FindFirstChild("HumanoidRootPart")
+                if not (killerRoot and playerRoot) then
+                    return
+                end
+                local facing = KillerFacesPlayer(killerRoot, playerRoot)
+                local clear = HasClearPath(killerCharacter, playerRoot, killerRoot)
+                if not (facing and clear) then
+                    return
+                end
+
+                if FireParry() then
+                    if State.autoParryDebug then
+                        Notify("Auto Parry", ("RAGE INSTANT dist=%.1f tpos=%.2f"):format(
+                            distance, tonumber(track.TimePosition) or -1), 2)
+                    end
+                end
+            end)
+
+            -- PATH 3: main (9).lua lines 5574-5621. Heartbeat re-arm of the
+            -- scheduled path, so a missed/failed one-shot delay still retries.
+            RunService.Heartbeat:Connect(function()
                 if not State.autoParryEnabled then
                     return
                 end
@@ -7781,6 +8091,30 @@ local function BolongHub()
                         connectedKillerHumanoids[humanoid] = nil
                     end
                 end
+
+                local killerCharacter = FindKillerModel()
+                if not killerCharacter then
+                    return
+                end
+
+                local distance = GetDistanceToKiller(killerCharacter)
+                local detectRadius = (tonumber(State.parryRadius) or 14) + AUTO_PARRY_DETECT_PADDING
+                if distance > detectRadius then
+                    return
+                end
+
+                local track = GetAttackingTrack(killerCharacter)
+                if not track then
+                    return
+                end
+
+                if (tick() - autoParryHeartbeatLast) <= 0.15 then
+                    return
+                end
+                autoParryHeartbeatLast = tick()
+                _G.BOLONG_KILLER_SWING = tick()
+                SmoothFaceArm(killerCharacter, track)
+                ScheduleAttack(killerCharacter, track)
             end)
 
             ----------------------------------------------------------------------
@@ -7799,7 +8133,7 @@ local function BolongHub()
             ----------------------------------------------------------------------
             local TeamsService = game:GetService("Teams")
 
-            local function FindKillerModel()
+            FindKillerModel = function()
                 local ok, tagged = pcall(function()
                     return CollectionService:GetTagged("Killer")
                 end)
@@ -7832,7 +8166,6 @@ local function BolongHub()
             end
 
             _G.__ZINKA_KILLERCHAR = FindKillerModel
-
             local parryRadiusRingModel = Instance.new("Model")
             parryRadiusRingModel.Name = "ZINKA_ParryRing"
 
@@ -12214,7 +12547,23 @@ local function BolongHub()
                         State.state_unhookYourself_bfd8 = {}
                         State.state_unhookYourself_d58e = {}
                         State.state_unhookYourself_c84b = {}
+                        pcall(function()
+                            local character = LocalPlayer.Character
+                            local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+                            if humanoid then humanoid.AutoRotate = true end
+                        end)
                     end
+                    -- Keep the mobile button indicator in sync with the menu.
+                    if State.PaintAutoParryButton then pcall(State.PaintAutoParryButton) end
+                end,
+            })
+            var_section_4eef.AddToggle(var_section_4eef,{
+                -- Mobile-only on-screen toggle. PC users get the keybind below.
+                Title = "Toggle GUI Button", Default = false,
+                Content = "Tombol layar untuk menyalakan Auto Parry (mobile)",
+                Callback = function(var_value_d1f9)
+                    State.autoParryMobileButton = var_value_d1f9
+                    if State.RefreshAutoParryButton then pcall(State.RefreshAutoParryButton) end
                 end,
             })
             var_section_4eef.AddToggle(var_section_4eef,{
@@ -12226,6 +12575,33 @@ local function BolongHub()
                     if fn_ParryHelper_6254 then
                         fn_ParryHelper_6254(var_value_d1f9)
                     end
+                end,
+            })
+            var_section_2baa.AddToggle(var_section_2baa,{
+                -- main (9).lua handler_fc(): ParryMode == "Rage".
+                -- Rage turns on the RenderStepped instant-fire poll
+                -- (main (9).lua lines 5541-5572) which fires the parry the
+                -- moment an attack track appears, instead of relying only on
+                -- one delayed callback per swing.
+                Title = "Rage Mode", Default = true,
+                Callback = function(var_value_d1f9)
+                    State.autoParryRageMode = var_value_d1f9
+                end,
+            })
+            var_section_2baa.AddKeybind(var_section_2baa,{
+                -- PC keybind.
+                --
+                -- This UI library stores the bound key internally and fires the
+                -- callback when the key is PRESSED, without passing the key code
+                -- (same shape as "Unhook Keybind" / "GenBoost Keybind" elsewhere in
+                -- this script). So the callback must take no arguments, and it must
+                -- not try to validate an incoming key: an unbound (Unknown) keybind
+                -- never fires at all.
+                Title = "Toggle Keybind (PC)",
+                Default = Enum.KeyCode.Unknown,
+                Callback = function()
+                    if not State.ToggleAutoParry then return end
+                    pcall(State.ToggleAutoParry)
                 end,
             })
             var_section_2baa.AddSlider(var_section_2baa,{
@@ -12245,7 +12621,7 @@ local function BolongHub()
             })
 
             var_section_2baa.AddToggle(var_section_2baa,{
-                Title = "Face Killer (Smooth)", Default = true,
+                Title = "Face Killer (Snap)", Default = true,
                 Callback = function(var_value_d1f9)
                     State.autoParryAutoFace = var_value_d1f9
                     if not var_value_d1f9 then
@@ -12256,7 +12632,11 @@ local function BolongHub()
                 end,
             })
             var_section_2baa.AddSlider(var_section_2baa,{
-                Title = "Face Smoothness", Min = 2, Max = 30, Default = 14, Increment = 1,
+                -- Retained for backwards compatibility with saved settings.
+                -- The facing reaction is now a single instant snap, so there is no
+                -- turn rate to modulate any more. Kept only so old configs that
+                -- still write this value do not error.
+                Title = "Face Smoothness (unused)", Min = 2, Max = 30, Default = 14, Increment = 1,
                 Callback = function(var_value_d1f9)
                     State.autoParryFaceSmoothness = var_value_d1f9
                 end,
@@ -12829,11 +13209,13 @@ local function BolongHub()
                 Title = "Show Hook Counter",
                 Default = Config.cfg_antiFlashlightBlind_774e,
                 Callback = function(var_value_d1f9)
-                    Config.cfg_antiFlashlightBlind_774e = var_value_d1f9
-                    if var_value_d1f9 then
-                        if State._HookCounter_Enable then pcall(State._HookCounter_Enable) end
-                    else
-                        if State._HookCounter_Disable then pcall(State._HookCounter_Disable) end
+                    -- Route through the same setter the global hook uses, so the
+                    -- feature flag, the connections and the labels always agree.
+                    -- Previously the callback wrote Config directly and only poked
+                    -- the enable/disable helpers, so State.hookCounterEnabled could
+                    -- stay stale and the 0.5s redraw loop would never run.
+                    if _G.Bolong_SetShowHookCounter then
+                        pcall(_G.Bolong_SetShowHookCounter, var_value_d1f9)
                     end
                 end,
             })
