@@ -6864,8 +6864,8 @@ local function BolongHub()
             --   2) Parry timing follows animation hit point (33%) - RTT*2.
             --   3) The final decision is re-checked at execution time.
             --   4) Final hit range is independent from Parry Radius: it is
-            --      AUTO_PARRY_TRIGGER_RANGE (7.5) for an instant hit, or
-            --      AUTO_PARRY_TRIGGER_RANGE_HELD (8.5) when the killer holds the
+            --      AUTO_PARRY_TRIGGER_RANGE (7) for an instant hit, or
+            --      AUTO_PARRY_TRIGGER_RANGE_HELD (8) when the killer holds the
             --      swing. Parry Radius can only tighten it further.
             --   5) Killer-facing + clear path are used as geometric confirmation
             --      only on the predicted (beyond range) path.
@@ -6884,8 +6884,8 @@ local function BolongHub()
             --     -> wider radius, the killer is committed to the attack for longer
             --   * killer hits instantly
             --     -> tighter radius
-            local AUTO_PARRY_TRIGGER_RANGE = 7.5
-            local AUTO_PARRY_TRIGGER_RANGE_HELD = 8.5
+            local AUTO_PARRY_TRIGGER_RANGE = 7
+            local AUTO_PARRY_TRIGGER_RANGE_HELD = 8
             local AUTO_PARRY_TRIGGER_RANGE_MIN = 5.0
             local AUTO_PARRY_DETECT_PADDING = 3.0
             local AUTO_PARRY_KILLER_DOT = 0.72
@@ -6895,6 +6895,13 @@ local function BolongHub()
             local AUTO_PARRY_EXECUTION_LOCK = 0.10
             local AUTO_PARRY_PREDICT_WINDOW = 0.08
             local AUTO_PARRY_RESULT_LOCK = 0.45
+            -- How many ms before the calculated hit point to trigger the parry.
+            -- main (9).lua uses ZinkaValues.ParryWindow (default 140ms).
+            -- Larger value = earlier parry = safer but more obvious.
+            local AUTO_PARRY_WINDOW_MS = 140
+            -- Upper safety clamp on how early the delay can be; matches
+            -- main (9).lua's  remaining - LOCK*0.7  (0.8*0.7 = 0.56).
+            local AUTO_PARRY_LOCK = 0.8
 
             local attackById = {
                 ["113255068724446"] = true, ["74968262036854"] = true,
@@ -7296,10 +7303,19 @@ local function BolongHub()
                     local length = tonumber(track.Length) or 0
                     local position = tonumber(track.TimePosition) or 0
                     local remaining = length * AUTO_PARRY_HIT_AT - position
-                    if length > 0.05 then
-                        remaining = math.max(0, remaining)
+                    if length > 0.05 and remaining > 0 then
+                        -- Mirror main (9).lua timing:
+                        --   delay = remaining - pingLead - ParryWindow/1000
+                        -- clamped above by remaining - LOCK*0.7 so we don't fire
+                        -- absurdly early on very long animations.
                         local pingLead = GetNetworkSeconds() * AUTO_PARRY_PING_MULTIPLIER
-                        delayTime = math.max(AUTO_PARRY_MIN_DELAY, remaining - pingLead)
+                        local windowLead = AUTO_PARRY_WINDOW_MS / 1000
+                        local raw = remaining - pingLead - windowLead
+                        local ceiling = remaining - AUTO_PARRY_LOCK * 0.7
+                        if raw < ceiling then
+                            raw = ceiling
+                        end
+                        delayTime = math.max(AUTO_PARRY_MIN_DELAY, raw)
                     end
                 end
 
@@ -7348,8 +7364,8 @@ local function BolongHub()
             ----------------------------------------------------------------------
             local SMOOTH_FACE_WINDOW = 0.30
             local SMOOTH_FACE_MAX_WINDOW = 0.60
-            local SMOOTH_FACE_MIN_ERROR_DEG = 4
-            local SMOOTH_FACE_MAX_TURN_RATE = 720
+            local SMOOTH_FACE_MIN_ERROR_DEG = 2
+            local SMOOTH_FACE_MAX_TURN_RATE = 1080
             local SMOOTH_FACE_MAX_WINDOW_TURN = 200
             local SMOOTH_FACE_SMOOTHNESS_REF = 14
 
