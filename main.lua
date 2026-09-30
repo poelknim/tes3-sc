@@ -146,6 +146,9 @@ local function BolongHub()
             var_originalValue_a386       = (0.0),
             state_unhookYourself_bfd8     = {},
             aimStrictness       = 0.1,
+            autoParryAutoFace = true,
+            autoParryFaceSmoothness = 14,
+            autoParryFaceLead = 0.08,
             var_originalValue_b002  = (0.0),
             state_unhookYourself_d58e      = {},
             state_unhookYourself_c84b = {},
@@ -6853,32 +6856,27 @@ local function BolongHub()
         local fn_ParryHelper_6254
         do
             ----------------------------------------------------------------------
-            -- AUTO PARRY V4
-            -- Reference engine derived from the working ZINKA parry mechanism.
-            -- Key behavior:
-            --   1) Detection radius is ONLY an arming/detection envelope.
-            --   2) Parry timing follows animation hit point (33%) - RTT*2.
-            --   3) The final decision is re-checked at execution time.
-            --   4) Final hit range is independent from Parry Radius.
-            --   5) Killer-facing + clear path are used as geometric confirmation.
-            --   6) Direct Parry controller + parry RemoteEvent are both supported,
-            --      matching the reference's successful execution path.
-            --   7) Auto-facing is intentionally NOT applied in this baseline build;
-            --      first reproduce the reference behavior before adding rotation.
-            ----------------------------------------------------------------------
+            -- AUTO PARRY V7 - BOLONGHUB + ZINKA REFERENCE ENGINE + SMOOTH FACE
+            --
+            -- Source basis:
+            --   * BolongHub keeps its own GUI/radius visualization.
+            --   * ZINKA's reference Parry engine supplies controller/remote access,
+            --     attack classification, AnimationPlayed + RenderStepped coverage,
+            --     and final range checking.
+            --   * Smooth auto-facing is an additional layer and NEVER replaces the
+            --     reference Parry trigger.
+            --
+            -- IMPORTANT:
+            --   * State.parryRadius is visualization/detection only.
+            --   * Final Parry range is PARRY_HIT_TRIGGER_RANGE.
 
-            local AUTO_PARRY_HIT_AT = 0.33
-            local AUTO_PARRY_HIT_RANGE = 6.0
-            local AUTO_PARRY_DETECT_PADDING = 3.0
-            local AUTO_PARRY_KILLER_DOT = 0.72
-            local AUTO_PARRY_PING_MULTIPLIER = 2.0
-            local AUTO_PARRY_MIN_DELAY = 0.05
-            local AUTO_PARRY_PING_MAX = 1.0
-            local AUTO_PARRY_EXECUTION_LOCK = 0.10
-            local AUTO_PARRY_PREDICT_WINDOW = 0.08
-            local AUTO_PARRY_RESULT_LOCK = 0.45
+            local PARRY_HIT_TRIGGER_RANGE = 9.0
+            local AUTO_FACE_RANGE = 14.0
+            local ATTACK_TRACK_MAX_AGE = 0.90
+            local ATTACK_SCAN_DISTANCE = 40.0
+            local ATTACK_REARM_TIME = 0.12
 
-            local attackById = {
+            local ATTACK_IDS = {
                 ["113255068724446"] = true, ["74968262036854"] = true,
                 ["135002183282873"] = true, ["121216847022485"] = true,
                 ["117042998468241"] = true, ["133963973694098"] = true,
@@ -6891,7 +6889,7 @@ local function BolongHub()
                 ["138720291317243"] = true,
             }
 
-            local nonAttackById = {
+            local NON_ATTACK_IDS = {
                 ["110360975271091"] = true, ["111229698330816"] = true,
                 ["125750702"] = true, ["180436334"] = true,
                 ["182393478"] = true, ["178130996"] = true,
@@ -6901,50 +6899,104 @@ local function BolongHub()
                 ["110850539331763"] = true, ["130012819736632"] = true,
             }
 
-            local attackNameHints = {
+            local ATTACK_NAME_HINTS = {
                 "attack", "lunge", "swing", "slash", "strike", "stab", "hit", "m1", "m2",
                 "spear", "throw", "flask", "leap", "charge", "cleave", "chop", "slam",
                 "sweep", "bash", "smash", "reap", "swipe", "pound",
             }
 
-            local ignoreNameHints = {
+            local IGNORE_NAME_HINTS = {
                 "grab", "carry", "hook", "pickup", "idle", "walk", "run", "vault", "break",
                 "kick", "pursuit", "corrupt", "inject", "activate", "stalk", "emote", "taunt", "reload",
             }
 
-            local controllerCache = nil
-            local controllerCacheAt = 0
-            local parryRemote = nil
-            local parryRemoteResolved = false
-            local lastParryAt = -math.huge
-            local lastParryResultAt = -math.huge
-            local pendingByCharacter = {}
+            local activeAttacks = {}
+            local connectedHumanoids = {}
+            local lastTrigger = -math.huge
+            local faceAutoRotateBackup = nil
+            local faceAutoRotateHumanoid = nil
+            local parryControllerCache = nil
+            local parryControllerScanAt = 0
+            local parryRemoteCache = nil
+            local parryRemoteScanAt = 0
 
-            local function GetParryRemote()
-                if parryRemoteResolved then
-                    return parryRemote
-                end
-                parryRemoteResolved = true
-                pcall(function()
-                    local remotes = ReplicatedStorage:FindFirstChild("Remotes")
-                    local items = remotes and remotes:FindFirstChild("Items")
-                    local dagger = items and items:FindFirstChild("Parrying Dagger")
-                    local remote = dagger and dagger:FindFirstChild("parry")
-                    if remote and remote:IsA("RemoteEvent") then
-                        parryRemote = remote
-                    end
-                end)
-                return parryRemote
+            local stats = {
+                fired = 0,
+                lastDistance = math.huge,
+                lastAttack = "",
+                lastPing = 0,
+            }
+            _G.ZINKA_PARRYSTAT = stats
+
+            local function GetPing()
+                local ping = 0
+                pcall(function() ping = tonumber(LocalPlayer:GetNetworkPing()) or 0 end)
+                ping = math.clamp(ping, 0, 1)
+                stats.lastPing = ping
+                return ping
+            end
+            _G.__ZINKA_PING = GetPing
+
+            local function GetRoot(character)
+                return character and character:FindFirstChild("HumanoidRootPart") or nil
             end
 
-            local function FindParryController(forceRefresh)
-                if not forceRefresh and controllerCache and (os.clock() - controllerCacheAt) < 2 then
-                    return controllerCache
+            local function GetDistance(killerCharacter)
+                local playerRoot = GetRoot(LocalPlayer.Character)
+                local killerRoot = GetRoot(killerCharacter)
+                if not playerRoot or not killerRoot then
+                    return math.huge, playerRoot, killerRoot
                 end
-                controllerCache = nil
-                controllerCacheAt = os.clock()
+                return (killerRoot.Position - playerRoot.Position).Magnitude, playerRoot, killerRoot
+            end
 
-                if typeof(getgc) ~= "function" then
+            local function ClassifyAttack(track)
+                if not track or not track.Animation then return false end
+                local animation = track.Animation
+                local id = tostring(animation.AnimationId or ""):match("%d+")
+                if id then
+                    if NON_ATTACK_IDS[id] then return false end
+                    if ATTACK_IDS[id] then return true end
+                end
+                local name = tostring(animation.Name or ""):lower():gsub("%s+", "")
+                if name == "lungehold" or name:find("lungehold", 1, true) then return true end
+                for _, ignored in ipairs(IGNORE_NAME_HINTS) do
+                    if name:find(ignored, 1, true) then return false end
+                end
+                for _, hint in ipairs(ATTACK_NAME_HINTS) do
+                    if name:find(hint, 1, true) then return true end
+                end
+                return false
+            end
+
+            local function IsAttackActive(track)
+                if not track or not track.IsPlaying then return false end
+                local started = activeAttacks[track]
+                if not started then
+                    started = os.clock()
+                    activeAttacks[track] = started
+                end
+                return os.clock() - started <= ATTACK_TRACK_MAX_AGE
+            end
+
+            -- Adapted from the reference script's getgc-based Parry controller lookup.
+            local function GetParryController()
+                if parryControllerCache then
+                    local ok = pcall(function()
+                        return parryControllerCache.player == LocalPlayer
+                    end)
+                    if ok and parryControllerCache.player == LocalPlayer then
+                        return parryControllerCache
+                    end
+                    parryControllerCache = nil
+                end
+
+                if os.clock() - parryControllerScanAt < 1.5 then
+                    return nil
+                end
+                parryControllerScanAt = os.clock()
+
+                if type(getgc) ~= "function" then
                     return nil
                 end
 
@@ -6953,89 +7005,66 @@ local function BolongHub()
                     return nil
                 end
 
-                for _, obj in ipairs(objects) do
-                    if type(obj) == "table" then
-                        local playerValue = rawget(obj, "player")
-                        local parryEvent = rawget(obj, "parryEvent")
-                        local resolving = rawget(obj, "isParryResolving")
-                        local parryMethod = rawget(obj, "Parry") or obj.Parry
-                        if playerValue == LocalPlayer and parryEvent ~= nil and resolving ~= nil and type(parryMethod) == "function" then
-                            controllerCache = obj
-                            return obj
-                        end
+                for _, object in ipairs(objects) do
+                    if type(object) == "table"
+                        and rawget(object, "player") == LocalPlayer
+                        and rawget(object, "parryEvent") ~= nil
+                        and rawget(object, "isParryResolving") ~= nil then
+                        parryControllerCache = object
+                        return object
                     end
                 end
                 return nil
             end
 
-            local function GetNetworkSeconds()
-                local value = 0.065
-                pcall(function()
-                    value = tonumber(LocalPlayer:GetNetworkPing()) or value
-                end)
-                return math.clamp(value, 0.0, AUTO_PARRY_PING_MAX)
+            local function GetParryRemote()
+                if parryRemoteCache and parryRemoteCache.Parent then
+                    return parryRemoteCache
+                end
+                if os.clock() - parryRemoteScanAt < 0.5 then return nil end
+                parryRemoteScanAt = os.clock()
+                local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+                local items = remotes and remotes:FindFirstChild("Items")
+                local dagger = items and items:FindFirstChild("Parrying Dagger")
+                local remote = dagger and dagger:FindFirstChild("parry")
+                if remote and remote:IsA("RemoteEvent") then
+                    parryRemoteCache = remote
+                    return remote
+                end
+                return nil
             end
 
-            local function CanExecuteParry()
-                if not State.autoParryEnabled then
-                    return false
-                end
+            local function CanParryNow()
+                if not State.autoParryEnabled then return false end
+                if os.clock() - lastTrigger < ATTACK_REARM_TIME then return false end
+                if LocalPlayer:GetAttribute("EquippedItem") ~= "Parrying Dagger" then return false end
+                if LocalPlayer:GetAttribute("IsDead") then return false end
+                local character = LocalPlayer.Character
+                if not character then return false end
+                if character:GetAttribute("IsCarried") or character:GetAttribute("IsHooked") then return false end
+                if CollectionService:HasTag(character, "Silenced") then return false end
 
-                local now = tick()
-                if now - lastParryAt < AUTO_PARRY_EXECUTION_LOCK then
-                    return false
-                end
-                if now - lastParryResultAt < AUTO_PARRY_RESULT_LOCK then
-                    return false
-                end
-
-                local controller = FindParryController(false)
+                local controller = GetParryController()
                 if controller then
-                    if rawget(controller, "isParryOnCooldown") == true then
-                        return false
-                    end
-                    if rawget(controller, "isParryResolving") == true then
-                        return false
-                    end
+                    if rawget(controller, "isParryOnCooldown") == true then return false end
+                    if rawget(controller, "isParryResolving") == true then return false end
                 end
-
-                local playerCharacter = LocalPlayer.Character
-                if not playerCharacter then
-                    return false
-                end
-                if LocalPlayer:GetAttribute("EquippedItem") ~= "Parrying Dagger" then
-                    return false
-                end
-                if LocalPlayer:GetAttribute("IsDead") then
-                    return false
-                end
-                if playerCharacter:GetAttribute("IsCarried") or playerCharacter:GetAttribute("IsHooked") then
-                    return false
-                end
-                if CollectionService:HasTag(playerCharacter, "Silenced") then
-                    return false
-                end
-
                 return true
             end
 
-            local function FireParry()
-                if not CanExecuteParry() then
-                    return false
-                end
-
-                local now = tick()
-                lastParryAt = now
+            local function FireParryImmediately(reason, distance, attackName)
+                if not CanParryNow() then return false end
 
                 local fired = false
-                local controller = FindParryController(false)
-                if controller then
+                local controller = GetParryController()
+                if controller and type(rawget(controller, "Parry")) == "function" then
                     pcall(function()
                         controller:Parry()
                         fired = true
                     end)
                 end
 
+                -- Reference fallback/parallel remote path.
                 local remote = GetParryRemote()
                 if remote then
                     pcall(function()
@@ -7044,314 +7073,234 @@ local function BolongHub()
                     end)
                 end
 
-                if not fired then
-                    -- UI/input fallback, matching the reference script's fallback path.
+                if not fired and typeof(firesignal) == "function" then
                     pcall(function()
                         local survivorGui = PlayerGui:FindFirstChild("Survivor-mob")
                         local controls = survivorGui and survivorGui:FindFirstChild("Controls")
-                        local mobileButton = controls and controls:FindFirstChild("Gui-mob")
-                        if mobileButton and mobileButton:IsA("ImageButton") and typeof(firesignal) == "function" then
-                            firesignal(mobileButton.MouseButton1Down)
-                            task.defer(function()
-                                if mobileButton.Parent then
-                                    firesignal(mobileButton.MouseButton1Up)
-                                end
-                            end)
+                        local button = controls and controls:FindFirstChild("Gui-mob")
+                        if button and button:IsA("ImageButton") then
+                            firesignal(button.MouseButton1Down)
+                            firesignal(button.MouseButton1Up)
                             fired = true
                         end
                     end)
                 end
 
                 if fired then
-                    return true
-                end
-
-                lastParryAt = -math.huge
-                return false
-            end
-
-            task.spawn(function()
-                pcall(function()
-                    local remotes = ReplicatedStorage:WaitForChild("Remotes", 5)
-                    local items = remotes and remotes:WaitForChild("Items", 5)
-                    local dagger = items and items:WaitForChild("Parrying Dagger", 5)
-                    local resultRemote = dagger and dagger:WaitForChild("parryResult", 5)
-                    if resultRemote and resultRemote:IsA("RemoteEvent") then
-                        resultRemote.OnClientEvent:Connect(function(success)
-                            lastParryResultAt = tick()
-                            if State.autoParryDebug then
-                                Notify("Auto Parry", success and "PARRY HIT" or "PARRY MISS", 1)
-                            end
+                    lastTrigger = os.clock()
+                    stats.fired += 1
+                    stats.lastDistance = distance or math.huge
+                    stats.lastAttack = tostring(attackName or reason or "attack")
+                    if State.autoParryDebug then
+                        pcall(function()
+                            Notify("Auto Parry", string.format("PARRY %.2f studs | %s", distance or -1, stats.lastAttack), 0.8)
                         end)
                     end
-                end)
-            end)
-
-            local function IsAttackTrack(track)
-                if not track or not track.Animation then
-                    return false
                 end
-
-                local animation = track.Animation
-                local id = tostring(animation.AnimationId or ""):match("%d+")
-                if id then
-                    if nonAttackById[id] then
-                        return false
-                    end
-                    if attackById[id] then
-                        return true
-                    end
-                end
-
-                local name = tostring(animation.Name or ""):lower():gsub("%s+", "")
-                if name == "lungehold" or name:find("lungehold", 1, true) then
-                    return true
-                end
-
-                for _, ignored in ipairs(ignoreNameHints) do
-                    if name:find(ignored, 1, true) then
-                        return false
-                    end
-                end
-                for _, hint in ipairs(attackNameHints) do
-                    if name:find(hint, 1, true) then
-                        return true
-                    end
-                end
-
-                return false
+                return fired
             end
 
-            local function GetDistanceToKiller(killerCharacter)
-                local playerCharacter = LocalPlayer.Character
-                local playerRoot = playerCharacter and playerCharacter:FindFirstChild("HumanoidRootPart")
-                local killerRoot = killerCharacter and killerCharacter:FindFirstChild("HumanoidRootPart")
-                if not playerRoot or not killerRoot then
-                    return math.huge, nil, nil
+            local function RestoreAutoRotate()
+                if faceAutoRotateHumanoid and faceAutoRotateHumanoid.Parent and faceAutoRotateBackup ~= nil then
+                    pcall(function() faceAutoRotateHumanoid.AutoRotate = faceAutoRotateBackup end)
                 end
-                return (killerRoot.Position - playerRoot.Position).Magnitude, playerRoot, killerRoot
+                faceAutoRotateHumanoid = nil
+                faceAutoRotateBackup = nil
             end
 
-            local function KillerFacesPlayer(killerRoot, playerRoot)
-                if not killerRoot or not playerRoot then
-                    return false, -1
-                end
-                local delta = playerRoot.Position - killerRoot.Position
-                local horizontal = Vector3.new(delta.X, 0, delta.Z)
-                if horizontal.Magnitude <= 0.05 then
-                    return true, 1
-                end
-                horizontal = horizontal.Unit
-                local forward = Vector3.new(killerRoot.CFrame.LookVector.X, 0, killerRoot.CFrame.LookVector.Z)
-                if forward.Magnitude <= 0.05 then
-                    return false, -1
-                end
-                forward = forward.Unit
-                return forward:Dot(horizontal) > AUTO_PARRY_KILLER_DOT, forward:Dot(horizontal)
-            end
+            local function SmoothFaceKiller(killerCharacter, dt)
+                if State.autoParryAutoFace == false then return false end
+                local character = LocalPlayer.Character
+                local playerRoot = GetRoot(character)
+                local killerRoot = GetRoot(killerCharacter)
+                local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+                if not playerRoot or not killerRoot or not humanoid or humanoid.Health <= 0 then return false end
 
-            local function HasClearPath(killerCharacter, playerRoot, killerRoot)
-                if not killerCharacter or not playerRoot or not killerRoot then
-                    return false
+                local distance = (killerRoot.Position - playerRoot.Position).Magnitude
+                if distance > AUTO_FACE_RANGE then return false end
+
+                if faceAutoRotateHumanoid ~= humanoid then
+                    RestoreAutoRotate()
+                    faceAutoRotateHumanoid = humanoid
+                    faceAutoRotateBackup = humanoid.AutoRotate
                 end
+                pcall(function() humanoid.AutoRotate = false end)
 
-                local params = RaycastParams.new()
-                params.FilterType = Enum.RaycastFilterType.Exclude
-                params.FilterDescendantsInstances = {killerCharacter, LocalPlayer.Character}
-                params.IgnoreWater = true
+                local lead = math.clamp(tonumber(State.autoParryFaceLead) or 0.08, 0, 0.20)
+                local velocity = killerRoot.AssemblyLinearVelocity
+                local predicted = killerRoot.Position + Vector3.new(velocity.X, 0, velocity.Z) * lead
+                predicted = Vector3.new(predicted.X, playerRoot.Position.Y, predicted.Z)
 
-                local startPos = killerRoot.Position
-                local delta = playerRoot.Position - startPos
-                local length = delta.Magnitude
-                if length <= 0.05 then
-                    return true
-                end
+                local offset = predicted - playerRoot.Position
+                if offset.Magnitude <= 0.05 then return true end
 
-                local hit = workspace:Raycast(startPos, delta, params)
-                if hit and hit.Instance and hit.Instance:IsA("BasePart") and hit.Instance.CanCollide ~= false then
-                    return false
-                end
-
+                local desired = CFrame.lookAt(playerRoot.Position, predicted)
+                local smooth = math.clamp(tonumber(State.autoParryFaceSmoothness) or 14, 2, 30)
+                local delta = math.clamp(tonumber(dt) or (1 / 60), 0, 0.1)
+                local alpha = 1 - math.exp(-smooth * delta)
+                playerRoot.CFrame = playerRoot.CFrame:Lerp(desired, alpha)
                 return true
             end
 
-            local function IsActuallyInHitRange(killerCharacter, allowPrediction)
-                local distance, playerRoot, killerRoot = GetDistanceToKiller(killerCharacter)
-                if not playerRoot or not killerRoot then
-                    return false, distance, 0
-                end
+            local function TryHitRangeTrigger(killerCharacter, track)
+                if not State.autoParryEnabled then return false end
+                if not killerCharacter or not killerCharacter.Parent then return false end
+                if not track or not ClassifyAttack(track) or not IsAttackActive(track) then return false end
 
-                if distance <= AUTO_PARRY_HIT_RANGE then
-                    return true, distance, 0
-                end
+                local distance = GetDistance(killerCharacter)
+                if distance > PARRY_HIT_TRIGGER_RANGE then return false end
 
-                if not allowPrediction or distance > AUTO_PARRY_HIT_RANGE + 3 then
-                    return false, distance, 0
-                end
-
-                local killerVelocity = Vector3.new(killerRoot.AssemblyLinearVelocity.X, 0, killerRoot.AssemblyLinearVelocity.Z)
-                local playerVelocity = Vector3.new(playerRoot.AssemblyLinearVelocity.X, 0, playerRoot.AssemblyLinearVelocity.Z)
-                local toPlayer = Vector3.new(
-                    playerRoot.Position.X - killerRoot.Position.X,
-                    0,
-                    playerRoot.Position.Z - killerRoot.Position.Z
-                )
-
-                if toPlayer.Magnitude <= 0.05 then
-                    return true, distance, 0
-                end
-
-                local closing = math.max(0, (killerVelocity - playerVelocity):Dot(toPlayer.Unit))
-                local predictedDistance = distance - closing * AUTO_PARRY_PREDICT_WINDOW
-
-                local facing, dot = KillerFacesPlayer(killerRoot, playerRoot)
-                if predictedDistance <= AUTO_PARRY_HIT_RANGE and facing and HasClearPath(killerCharacter, playerRoot, killerRoot) then
-                    return true, predictedDistance, dot
-                end
-
-                return false, distance, dot
+                local attackName = track.Animation and track.Animation.Name or "attack"
+                return FireParryImmediately("hit-range", distance, attackName)
             end
 
-            local function ScheduleAttack(killerCharacter, track)
-                if not State.autoParryEnabled then
-                    return
-                end
-                if not killerCharacter or not killerCharacter.Parent or not track then
-                    return
-                end
-                if pendingByCharacter[killerCharacter] then
-                    return
-                end
-
-                local distance = GetDistanceToKiller(killerCharacter)
-                if distance > State.parryRadius + AUTO_PARRY_DETECT_PADDING then
-                    return
-                end
-
-                local animationName = tostring(track.Animation and track.Animation.Name or ""):lower():gsub("%s+", "")
-                local isLunge = animationName:find("lungehold", 1, true) ~= nil
-
-                local delayTime = AUTO_PARRY_MIN_DELAY
-                if not isLunge then
-                    local length = tonumber(track.Length) or 0
-                    local position = tonumber(track.TimePosition) or 0
-                    local remaining = length * AUTO_PARRY_HIT_AT - position
-                    if length > 0.05 then
-                        remaining = math.max(0, remaining)
-                        local pingLead = GetNetworkSeconds() * AUTO_PARRY_PING_MULTIPLIER
-                        delayTime = math.max(AUTO_PARRY_MIN_DELAY, remaining - pingLead)
-                    end
-                end
-
-                pendingByCharacter[killerCharacter] = true
-                task.delay(delayTime, function()
-                    pendingByCharacter[killerCharacter] = nil
-
-                    if not State.autoParryEnabled then
-                        return
-                    end
-                    if not killerCharacter or not killerCharacter.Parent then
-                        return
-                    end
-
-                    -- Critical: State.parryRadius is NOT the final trigger.
-                    -- We only fire when the killer is actually in/entering hit range.
-                    local inRange = IsActuallyInHitRange(killerCharacter, true)
-                    if not inRange then
-                        return
-                    end
-
-                    FireParry()
-                end)
+            local function HandleAnimation(killerCharacter, track)
+                if not State.autoParryEnabled then return end
+                if not ClassifyAttack(track) then return end
+                activeAttacks[track] = os.clock()
+                TryHitRangeTrigger(killerCharacter, track)
             end
-
-            local connectedKillerHumanoids = {}
 
             local function RegisterKiller(player, character)
-                if not player or player == LocalPlayer or not character then
-                    return
-                end
-                if player.Team and player.Team.Name:lower():find("killer", 1, true) == nil then
-                    return
-                end
-
+                if not player or player == LocalPlayer or not character then return end
+                if player.Team and tostring(player.Team.Name):lower():find("killer", 1, true) == nil then return end
                 local humanoid = character:FindFirstChildOfClass("Humanoid")
-                if not humanoid or connectedKillerHumanoids[humanoid] then
-                    return
-                end
-
+                if not humanoid or connectedHumanoids[humanoid] then return end
                 local animator = humanoid:FindFirstChildOfClass("Animator")
-                local function onAnimation(track)
-                    if not State.autoParryEnabled then
-                        return
-                    end
-                    if not IsAttackTrack(track) then
-                        return
-                    end
-
-                    _G.BOLONG_KILLER_SWING = tick()
-                    ScheduleAttack(character, track)
-                end
-
-                connectedKillerHumanoids[humanoid] = {}
-                connectedKillerHumanoids[humanoid].humanoid = humanoid
-                connectedKillerHumanoids[humanoid].anim = animator
-                connectedKillerHumanoids[humanoid].humanoidConn = humanoid.AnimationPlayed:Connect(onAnimation)
+                local entry = { humanoid = humanoid, animator = animator }
+                entry.humanoidConn = humanoid.AnimationPlayed:Connect(function(track)
+                    HandleAnimation(character, track)
+                end)
                 if animator then
-                    connectedKillerHumanoids[humanoid].animConn = animator.AnimationPlayed:Connect(onAnimation)
+                    entry.animatorConn = animator.AnimationPlayed:Connect(function(track)
+                        HandleAnimation(character, track)
+                    end)
                 end
-
+                connectedHumanoids[humanoid] = entry
                 humanoid.AncestryChanged:Connect(function()
-                    if not humanoid.Parent then
-                        local entry = connectedKillerHumanoids[humanoid]
-                        if entry then
-                            pcall(function() entry.humanoidConn:Disconnect() end)
-                            pcall(function() if entry.animConn then entry.animConn:Disconnect() end end)
-                        end
-                        connectedKillerHumanoids[humanoid] = nil
+                    if humanoid.Parent then return end
+                    local old = connectedHumanoids[humanoid]
+                    if old then
+                        pcall(function() old.humanoidConn:Disconnect() end)
+                        pcall(function() if old.animatorConn then old.animatorConn:Disconnect() end end)
                     end
+                    connectedHumanoids[humanoid] = nil
                 end)
             end
 
-            local function RefreshKillerConnections()
+            local function RefreshKillers()
                 for _, player in ipairs(Players:GetPlayers()) do
-                    if player ~= LocalPlayer then
+                    if player ~= LocalPlayer and player.Character then
                         RegisterKiller(player, player.Character)
                     end
                 end
             end
 
-            RefreshKillerConnections()
+            RefreshKillers()
+
             Players.PlayerAdded:Connect(function(player)
                 player.CharacterAdded:Connect(function(character)
-                    task.wait(0.5)
+                    task.wait(0.25)
                     RegisterKiller(player, character)
                 end)
             end)
+
             Players.PlayerRemoving:Connect(function()
-                task.defer(RefreshKillerConnections)
+                task.defer(RefreshKillers)
             end)
 
-            task.spawn(function()
-                while true do
-                    if State.autoParryEnabled then
-                        RefreshKillerConnections()
-                    end
-                    task.wait(0.5)
-                end
-            end)
-
-            RunService.RenderStepped:Connect(function()
+            RunService.RenderStepped:Connect(function(dt)
                 if not State.autoParryEnabled then
+                    RestoreAutoRotate()
                     return
                 end
 
-                for humanoid, entry in pairs(connectedKillerHumanoids) do
-                    if not humanoid or not humanoid.Parent then
-                        connectedKillerHumanoids[humanoid] = nil
+                for track, startedAt in pairs(activeAttacks) do
+                    if not track or not track.Parent or not track.IsPlaying or os.clock() - startedAt > ATTACK_TRACK_MAX_AGE then
+                        activeAttacks[track] = nil
+                    end
+                end
+
+                local facingActive = false
+                for _, player in ipairs(Players:GetPlayers()) do
+                    if player ~= LocalPlayer and player.Character and player.Team
+                        and tostring(player.Team.Name):lower():find("killer", 1, true) then
+                        local killerCharacter = player.Character
+                        local distance = GetDistance(killerCharacter)
+                        if distance <= ATTACK_SCAN_DISTANCE then
+                            local humanoid = killerCharacter:FindFirstChildOfClass("Humanoid")
+                            local animator = humanoid and humanoid:FindFirstChildOfClass("Animator")
+                            if animator then
+                                local ok, tracks = pcall(function() return animator:GetPlayingAnimationTracks() end)
+                                if ok and type(tracks) == "table" then
+                                    for _, track in ipairs(tracks) do
+                                        if ClassifyAttack(track) and IsAttackActive(track) then
+                                            -- Face smoothly while the attack is actually active.
+                                            if SmoothFaceKiller(killerCharacter, dt) then
+                                                facingActive = true
+                                            end
+                                            if TryHitRangeTrigger(killerCharacter, track) then
+                                                break
+                                            end
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+
+                if not facingActive then
+                    RestoreAutoRotate()
+                end
+            end)
+
+            -- Reference-style ability triggers. They still obey the independent
+            -- hit-range gate rather than State.parryRadius.
+            local referenceAbilities = {
+                {"Attacks", "BasicAttack"},
+                {"Attacks", "Lunge"},
+                {"Attacks", "LungeDetect"},
+                {"Killers", "SlowAttack"},
+                {"Killers", "Hidden", "M2"},
+                {"Killers", "Hidden", "preparem2"},
+                {"Killers", "Hidden", "Leap"},
+                {"Killers", "Masked", "alexattack"},
+                {"Killers", "Veil", "Spearthrow"},
+                {"Killers", "Veil", "PiercingReverie"},
+                {"Killers", "Cure", "ThrowFlask"},
+            }
+
+            local function ResolveRemote(path)
+                local node = ReplicatedStorage:FindFirstChild("Remotes")
+                for _, name in ipairs(path) do
+                    node = node and node:FindFirstChild(name)
+                    if not node then break end
+                end
+                return node
+            end
+
+            task.spawn(function()
+                task.wait(2)
+                for _, path in ipairs(referenceAbilities) do
+                    local remote = ResolveRemote(path)
+                    if remote and remote:IsA("RemoteEvent") then
+                        remote.OnClientEvent:Connect(function()
+                            if not State.autoParryEnabled then return end
+                            local getter = _G.__ZINKA_KILLERCHAR
+                            local killerCharacter = type(getter) == "function" and getter() or nil
+                            if not killerCharacter then return end
+                            local distance = GetDistance(killerCharacter)
+                            if distance <= PARRY_HIT_TRIGGER_RANGE then
+                                SmoothFaceKiller(killerCharacter, 1 / 60)
+                                FireParryImmediately("ability", distance, table.concat(path, "/"))
+                            end
+                        end)
                     end
                 end
             end)
+
+        end
 
             -- Preserve the original radius ESP implementation exactly as a visual aid.
             local radiusSegments = {}
@@ -11617,6 +11566,29 @@ local function BolongHub()
                 Title = "Aim Strictness", Min = -1, Max = (1.0), Default = 0.1, Increment = 0.1,
                 Callback = function(var_value_d1f9)
                     State.aimStrictness = var_value_d1f9
+                end,
+            })
+            var_section_2baa.AddToggle(var_section_2baa,{
+                Title = "Face Killer (Smooth)", Default = true,
+                Callback = function(var_value_d1f9)
+                    State.autoParryAutoFace = var_value_d1f9
+                    if not var_value_d1f9 then
+                        local character = LocalPlayer.Character
+                        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+                        if humanoid then pcall(function() humanoid.AutoRotate = true end) end
+                    end
+                end,
+            })
+            var_section_2baa.AddSlider(var_section_2baa,{
+                Title = "Face Smoothness", Min = 2, Max = 30, Default = 14, Increment = 1,
+                Callback = function(var_value_d1f9)
+                    State.autoParryFaceSmoothness = var_value_d1f9
+                end,
+            })
+            var_section_2baa.AddSlider(var_section_2baa,{
+                Title = "Face Lead (s)", Min = 0, Max = 0.20, Default = 0.08, Increment = 0.01,
+                Callback = function(var_value_d1f9)
+                    State.autoParryFaceLead = var_value_d1f9
                 end,
             })
 
