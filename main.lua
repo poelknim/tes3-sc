@@ -6894,14 +6894,10 @@ local function BolongHub()
             local AUTO_PARRY_PING_MAX = 1.0
             local AUTO_PARRY_EXECUTION_LOCK = 0.10
             local AUTO_PARRY_PREDICT_WINDOW = 0.08
-            local AUTO_PARRY_RESULT_LOCK = 0.45
-            -- How many ms before the calculated hit point to trigger the parry.
-            -- main (9).lua uses ZinkaValues.ParryWindow (default 140ms).
-            -- Larger value = earlier parry = safer but more obvious.
-            local AUTO_PARRY_WINDOW_MS = 100
-            -- Upper safety clamp on how early the delay can be; matches
-            -- main (9).lua's  remaining - LOCK*0.7  (0.8*0.7 = 0.56).
-            local AUTO_PARRY_LOCK = 0.8
+            -- Rage mode: short cooldown (0.5s instead of 1.2s), force-clear game
+            -- controller cooldown before each fire, both controller:Parry() +
+            -- remote:FireServer() are called simultaneously.
+            local AUTO_PARRY_RAGE_COOLDOWN = 0.5
 
             local attackById = {
                 ["113255068724446"] = true, ["74968262036854"] = true,
@@ -7001,6 +6997,29 @@ local function BolongHub()
                 return math.clamp(value, 0.0, AUTO_PARRY_PING_MAX)
             end
 
+            -- Force-clear the game's own parry cooldown state, mirroring
+            -- main (9).lua Rage mode's __ZINKA_NOPARRYCD.
+            local function ForceResetParryCooldown()
+                local controller = FindParryController(false)
+                if not controller then
+                    return
+                end
+                pcall(function()
+                    if rawget(controller, "isParryOnCooldown") then
+                        controller.isParryOnCooldown = false
+                    end
+                    if rawget(controller, "isParryResolving") then
+                        controller.isParryResolving = false
+                    end
+                    if type(rawget(controller, "cooldownToken")) == "number" then
+                        controller.cooldownToken = controller.cooldownToken + 1
+                    end
+                    if type(rawget(controller, "_refreshVisual")) == "function" then
+                        controller:_refreshVisual()
+                    end
+                end)
+            end
+
             local function CanExecuteParry()
                 if not State.autoParryEnabled then
                     return false
@@ -7009,19 +7028,6 @@ local function BolongHub()
                 local now = tick()
                 if now - lastParryAt < AUTO_PARRY_EXECUTION_LOCK then
                     return false
-                end
-                if now - lastParryResultAt < AUTO_PARRY_RESULT_LOCK then
-                    return false
-                end
-
-                local controller = FindParryController(false)
-                if controller then
-                    if rawget(controller, "isParryOnCooldown") == true then
-                        return false
-                    end
-                    if rawget(controller, "isParryResolving") == true then
-                        return false
-                    end
                 end
 
                 local playerCharacter = LocalPlayer.Character
@@ -7045,20 +7051,22 @@ local function BolongHub()
             end
 
             local function FireParry()
+                -- Force-clear the game cooldown BEFORE the can-execute check, so
+                -- isParryOnCooldown/isParryResolving never block us.
+                ForceResetParryCooldown()
+
                 if not CanExecuteParry() then
                     if State.autoParryDebug then
-                        -- Diagnose WHY it failed
                         local reason = "unknown"
                         if not State.autoParryEnabled then reason = "disabled"
                         elseif tick() - lastParryAt < AUTO_PARRY_EXECUTION_LOCK then reason = "exec lock"
-                        elseif tick() - lastParryResultAt < AUTO_PARRY_RESULT_LOCK then reason = "result lock"
                         elseif LocalPlayer:GetAttribute("EquippedItem") ~= "Parrying Dagger" then reason = "no dagger equipped"
                         elseif LocalPlayer:GetAttribute("IsDead") then reason = "dead"
                         else
                             local c = LocalPlayer.Character
                             if c and (c:GetAttribute("IsCarried") or c:GetAttribute("IsHooked")) then reason = "carried/hooked"
                             elseif c and CollectionService:HasTag(c, "Silenced") then reason = "silenced"
-                            else reason = "controller cooldown" end
+                            else reason = "check failed" end
                         end
                         Notify("Auto Parry", "BLOCKED: " .. reason, 2)
                     end
@@ -7068,6 +7076,8 @@ local function BolongHub()
                 local now = tick()
                 lastParryAt = now
 
+                -- Rage mode: fire BOTH paths simultaneously â€” controller:Parry()
+                -- AND remote:FireServer() â€” matching main (9).lua Rage path.
                 local fired = false
                 local controller = FindParryController(false)
                 if controller then
@@ -7075,18 +7085,26 @@ local function BolongHub()
                         controller:Parry()
                         fired = true
                     end)
-                end
-
-                local remote = GetParryRemote()
-                if remote then
-                    pcall(function()
-                        remote:FireServer()
-                        fired = true
-                    end)
+                    -- Also fire remote even if controller succeeds (Rage fires both)
+                    local remote = GetParryRemote()
+                    if remote then
+                        pcall(function()
+                            remote:FireServer()
+                            fired = true
+                        end)
+                    end
+                else
+                    -- No controller, try remote only
+                    local remote = GetParryRemote()
+                    if remote then
+                        pcall(function()
+                            remote:FireServer()
+                            fired = true
+                        end)
+                    end
                 end
 
                 if not fired then
-                    -- UI/input fallback, matching the reference script's fallback path.
                     pcall(function()
                         local survivorGui = PlayerGui:FindFirstChild("Survivor-mob")
                         local controls = survivorGui and survivorGui:FindFirstChild("Controls")
@@ -7104,6 +7122,8 @@ local function BolongHub()
                 end
 
                 if fired then
+                    -- Rage cooldown: 0.5s
+                    lastParryResultAt = now
                     return true
                 end
 
@@ -7314,24 +7334,22 @@ local function BolongHub()
                 local animationName = tostring(track.Animation and track.Animation.Name or ""):lower():gsub("%s+", "")
                 local isLunge = animationName:find("lungehold", 1, true) ~= nil
 
-                local delayTime = AUTO_PARRY_MIN_DELAY
+                -- Mode Rage timing (matches main (9).lua line 5213-5227):
+                -- Base delay = 0.06s. If animation length > 0.05s, delay is
+                -- remaining - pingLead (no window subtract), clamped.
+                local delayTime = 0.06
                 if not isLunge then
                     local length = tonumber(track.Length) or 0
                     local position = tonumber(track.TimePosition) or 0
                     local remaining = length * AUTO_PARRY_HIT_AT - position
                     if length > 0.05 and remaining > 0 then
-                        -- Mirror main (9).lua timing:
-                        --   delay = remaining - pingLead - ParryWindow/1000
-                        -- clamped above by remaining - LOCK*0.7 so we don't fire
-                        -- absurdly early on very long animations.
                         local pingLead = GetNetworkSeconds() * AUTO_PARRY_PING_MULTIPLIER
-                        local windowLead = AUTO_PARRY_WINDOW_MS / 1000
-                        local raw = remaining - pingLead - windowLead
-                        local ceiling = remaining - AUTO_PARRY_LOCK * 0.7
+                        local raw = remaining - pingLead
+                        local ceiling = remaining - 0.56
                         if raw < ceiling then
                             raw = ceiling
                         end
-                        delayTime = math.max(AUTO_PARRY_MIN_DELAY, raw)
+                        delayTime = math.max(0.06, raw)
                     end
                 end
 
