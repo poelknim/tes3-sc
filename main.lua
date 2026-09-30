@@ -6898,7 +6898,7 @@ local function BolongHub()
             -- How many ms before the calculated hit point to trigger the parry.
             -- main (9).lua uses ZinkaValues.ParryWindow (default 140ms).
             -- Larger value = earlier parry = safer but more obvious.
-            local AUTO_PARRY_WINDOW_MS = 0
+            local AUTO_PARRY_WINDOW_MS = 100
             -- Upper safety clamp on how early the delay can be; matches
             -- main (9).lua's  remaining - LOCK*0.7  (0.8*0.7 = 0.56).
             local AUTO_PARRY_LOCK = 0.8
@@ -7046,6 +7046,22 @@ local function BolongHub()
 
             local function FireParry()
                 if not CanExecuteParry() then
+                    if State.autoParryDebug then
+                        -- Diagnose WHY it failed
+                        local reason = "unknown"
+                        if not State.autoParryEnabled then reason = "disabled"
+                        elseif tick() - lastParryAt < AUTO_PARRY_EXECUTION_LOCK then reason = "exec lock"
+                        elseif tick() - lastParryResultAt < AUTO_PARRY_RESULT_LOCK then reason = "result lock"
+                        elseif LocalPlayer:GetAttribute("EquippedItem") ~= "Parrying Dagger" then reason = "no dagger equipped"
+                        elseif LocalPlayer:GetAttribute("IsDead") then reason = "dead"
+                        else
+                            local c = LocalPlayer.Character
+                            if c and (c:GetAttribute("IsCarried") or c:GetAttribute("IsHooked")) then reason = "carried/hooked"
+                            elseif c and CollectionService:HasTag(c, "Silenced") then reason = "silenced"
+                            else reason = "controller cooldown" end
+                        end
+                        Notify("Auto Parry", "BLOCKED: " .. reason, 2)
+                    end
                     return false
                 end
 
@@ -7337,10 +7353,18 @@ local function BolongHub()
                     -- or drifted during the wind-up.
                     local inRange = IsActuallyInHitRange(killerCharacter, true, triggerRadius)
                     if not inRange then
+                        if State.autoParryDebug then
+                            local d = GetDistanceToKiller(killerCharacter)
+                            Notify("Auto Parry", ("OUT OF RANGE at fire: %.1f > %.1f"):format(d, triggerRadius), 2)
+                        end
                         return
                     end
 
-                    FireParry()
+                    local parryOk = FireParry()
+                    if State.autoParryDebug and parryOk then
+                        Notify("Auto Parry", ("FIRE! dist=%.1f radius=%.1f delay=%.0fms"):format(
+                            GetDistanceToKiller(killerCharacter), triggerRadius, delayTime * 1000), 2)
+                    end
                 end)
             end
 
@@ -7425,8 +7449,46 @@ local function BolongHub()
                 smoothFaceTargetCharacter = killerCharacter
                 smoothFaceWindowUntil = now + window
                 smoothFaceWindowTurnBudget = SMOOTH_FACE_MAX_WINDOW_TURN
-                -- Face the attack source on the very first frame of the swing.
                 smoothFaceSnapPending = true
+
+                -- Immediately face the killer RIGHT NOW instead of waiting for the
+                -- next RenderStepped frame. This saves one frame of latency
+                -- (~16ms) and ensures the character is already facing the attacker
+                -- by the time ScheduleAttack runs.
+                local myChar = LocalPlayer.Character
+                local myHumanoid = myChar and myChar:FindFirstChildOfClass("Humanoid")
+                local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
+                local killerRoot = killerCharacter:FindFirstChild("HumanoidRootPart")
+                if myRoot and killerRoot and myHumanoid and myHumanoid.Health > 0
+                    and not SmoothFaceRotationLocked(myChar, myHumanoid, myRoot, killerCharacter) then
+                    -- Capture & disable AutoRotate
+                    if not smoothFaceWasApplied then
+                        smoothFacePreviousAutoRotate = myHumanoid.AutoRotate
+                        smoothFaceAppliedHumanoid = myHumanoid
+                        smoothFaceWasApplied = true
+                    end
+                    pcall(function() myHumanoid.AutoRotate = false end)
+
+                    local lead = math.clamp(tonumber(State.autoParryFaceLead) or 0.08, 0, 0.20)
+                    local tv = killerRoot.AssemblyLinearVelocity
+                    local aimX = killerRoot.Position.X + tv.X * lead
+                    local aimZ = killerRoot.Position.Z + tv.Z * lead
+                    local dx = aimX - myRoot.Position.X
+                    local dz = aimZ - myRoot.Position.Z
+                    if (dx * dx + dz * dz) > 0.0025 then
+                        local look = myRoot.CFrame.LookVector
+                        local curYaw = math.atan2(look.X, look.Z)
+                        local desYaw = math.atan2(dx, dz)
+                        local yawErr = (desYaw - curYaw + math.pi) % (math.pi * 2) - math.pi
+                        if math.abs(yawErr) >= math.rad(SMOOTH_FACE_MIN_ERROR_DEG) then
+                            pcall(function()
+                                myRoot.CFrame = myRoot.CFrame * CFrame.Angles(0, yawErr, 0)
+                            end)
+                        end
+                    end
+                    -- Mark the snap as consumed so RenderStepped doesn't double-snap
+                    smoothFaceSnapPending = false
+                end
             end
 
             local function SmoothFaceTarget()
