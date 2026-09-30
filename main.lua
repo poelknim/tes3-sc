@@ -142,6 +142,7 @@ local function BolongHub()
             var_rootPart_b267=(0.0), scpEspObjects={},
             autoParryEnabled    = false,
             parryRadiusEspEnabled  = true,
+            killerSightConeEnabled = false,
             parryRadius     = (10.0),
             var_originalValue_a386       = (0.0),
             state_unhookYourself_bfd8     = {},
@@ -6862,8 +6863,12 @@ local function BolongHub()
             --   1) Detection radius is ONLY an arming/detection envelope.
             --   2) Parry timing follows animation hit point (33%) - RTT*2.
             --   3) The final decision is re-checked at execution time.
-            --   4) Final hit range is independent from Parry Radius.
-            --   5) Killer-facing + clear path are used as geometric confirmation.
+            --   4) Final hit range is independent from Parry Radius: it is
+            --      AUTO_PARRY_TRIGGER_RANGE (7.5) for an instant hit, or
+            --      AUTO_PARRY_TRIGGER_RANGE_HELD (8.5) when the killer holds the
+            --      swing. Parry Radius can only tighten it further.
+            --   5) Killer-facing + clear path are used as geometric confirmation
+            --      only on the predicted (beyond range) path.
             --   6) Direct Parry controller + parry RemoteEvent are both supported,
             --      matching the reference's successful execution path.
             --   7) Auto-facing is intentionally NOT applied in this baseline build;
@@ -6871,7 +6876,17 @@ local function BolongHub()
             ----------------------------------------------------------------------
 
             local AUTO_PARRY_HIT_AT = 0.33
+            -- Fallback only. Every live call site passes an explicit maxRange
+            -- derived from GetTriggerRadius() below.
             local AUTO_PARRY_HIT_RANGE = 6.0
+            -- Final trigger radius, re-checked at the exact strike moment.
+            --   * killer HOLDS the hit for a few ms (charge / lungehold / wind-up)
+            --     -> wider radius, the killer is committed to the attack for longer
+            --   * killer hits instantly
+            --     -> tighter radius
+            local AUTO_PARRY_TRIGGER_RANGE = 7.5
+            local AUTO_PARRY_TRIGGER_RANGE_HELD = 8.5
+            local AUTO_PARRY_TRIGGER_RANGE_MIN = 5.0
             local AUTO_PARRY_DETECT_PADDING = 3.0
             local AUTO_PARRY_KILLER_DOT = 0.72
             local AUTO_PARRY_PING_MULTIPLIER = 2.0
@@ -7125,6 +7140,41 @@ local function BolongHub()
                 return false
             end
 
+            -- A "held" hit is one where the killer charges / holds the swing for a
+            -- few milliseconds before the strike lands (charge, lungehold, wind-up
+            -- style animations). Those get the wider trigger radius.
+            -- Only ever called on tracks that already passed IsAttackTrack, so a
+            -- stray match can only widen the radius, never arm a parry on its own.
+            local heldAttackNameHints = {
+                "lungehold", "hold", "charge", "windup", "winding", "delayed",
+            }
+
+            local function IsHeldAttackTrack(track)
+                if not track or not track.Animation then
+                    return false
+                end
+                local name = tostring(track.Animation.Name or ""):lower():gsub("%s+", "")
+                for _, hint in ipairs(heldAttackNameHints) do
+                    if name:find(hint, 1, true) then
+                        return true
+                    end
+                end
+                return false
+            end
+
+            -- The parry radius slider can only TIGHTEN the trigger radius, it can
+            -- never loosen it past the safety constants above.
+            local function GetTriggerRadius(track)
+                local held = IsHeldAttackTrack(track)
+                local radius = held and AUTO_PARRY_TRIGGER_RANGE_HELD or AUTO_PARRY_TRIGGER_RANGE
+                local slider = tonumber(State.parryRadius)
+                if slider then
+                    radius = math.min(radius, slider)
+                end
+                radius = math.clamp(radius, AUTO_PARRY_TRIGGER_RANGE_MIN, AUTO_PARRY_TRIGGER_RANGE_HELD)
+                return radius
+            end
+
             local function GetDistanceToKiller(killerCharacter)
                 local playerCharacter = LocalPlayer.Character
                 local playerRoot = playerCharacter and playerCharacter:FindFirstChild("HumanoidRootPart")
@@ -7178,17 +7228,21 @@ local function BolongHub()
                 return true
             end
 
-            local function IsActuallyInHitRange(killerCharacter, allowPrediction)
+            local function IsActuallyInHitRange(killerCharacter, allowPrediction, maxRange)
+                local triggerRange = tonumber(maxRange) or AUTO_PARRY_HIT_RANGE
                 local distance, playerRoot, killerRoot = GetDistanceToKiller(killerCharacter)
                 if not playerRoot or not killerRoot then
                     return false, distance, 0
                 end
 
-                if distance <= AUTO_PARRY_HIT_RANGE then
+                -- Inside the trigger radius the swing itself is the confirmation:
+                -- requiring killer-facing + clear line of sight on top of that is
+                -- what made the parry silently fail at range.
+                if distance <= triggerRange then
                     return true, distance, 0
                 end
 
-                if not allowPrediction or distance > AUTO_PARRY_HIT_RANGE + 3 then
+                if not allowPrediction or distance > triggerRange + 3 then
                     return false, distance, 0
                 end
 
@@ -7208,7 +7262,7 @@ local function BolongHub()
                 local predictedDistance = distance - closing * AUTO_PARRY_PREDICT_WINDOW
 
                 local facing, dot = KillerFacesPlayer(killerRoot, playerRoot)
-                if predictedDistance <= AUTO_PARRY_HIT_RANGE and facing and HasClearPath(killerCharacter, playerRoot, killerRoot) then
+                if predictedDistance <= triggerRange and facing and HasClearPath(killerCharacter, playerRoot, killerRoot) then
                     return true, predictedDistance, dot
                 end
 
@@ -7226,8 +7280,11 @@ local function BolongHub()
                     return
                 end
 
+                local triggerRadius = GetTriggerRadius(track)
+
                 local distance = GetDistanceToKiller(killerCharacter)
-                if distance > State.parryRadius + AUTO_PARRY_DETECT_PADDING then
+                local detectEnvelope = math.max(tonumber(State.parryRadius) or 0, triggerRadius) + AUTO_PARRY_DETECT_PADDING
+                if distance > detectEnvelope then
                     return
                 end
 
@@ -7258,8 +7315,11 @@ local function BolongHub()
                     end
 
                     -- Critical: State.parryRadius is NOT the final trigger.
-                    -- We only fire when the killer is actually in/entering hit range.
-                    local inRange = IsActuallyInHitRange(killerCharacter, true)
+                    -- The swing decides the radius: a killer that HELD the hit for
+                    -- a few ms gets the wider radius, an instant hit the tighter
+                    -- one. Re-checked here because the killer may have closed in
+                    -- or drifted during the wind-up.
+                    local inRange = IsActuallyInHitRange(killerCharacter, true, triggerRadius)
                     if not inRange then
                         return
                     end
@@ -7276,10 +7336,12 @@ local function BolongHub()
             --   1) The reaction window is armed ONLY by a real killer hit/swing
             --      event (same signal that arms the parry), never by "killer is
             --      simply nearby".
-            --   2) Detection is 360 degrees, but the turn itself is a
-            --      rate-limited shortest-path Y-only rotation with a deadzone and
-            --      a per-window angle budget, so a swing behind the survivor can
-            --      never degenerate into a continuous 360 spin.
+            --   2) Detection is 360 degrees and the first frame snaps straight to
+            --      the attacker, but the turn is always a shortest-path Y-only
+            --      rotation: yawError is wrapped to +/-180 deg, so the snap is at
+            --      most a half turn and can never become a 360 spin. Tracking
+            --      after the snap is rate-limited with a deadzone and a per-window
+            --      angle budget.
             --   3) The window closes as soon as the swing ends and is skipped
             --      entirely while knocked / carried / hooked / seated, so the
             --      survivor never fights the killer's own carry transform.
@@ -7297,6 +7359,7 @@ local function BolongHub()
             local smoothFaceTargetCharacter = nil
             local smoothFaceWindowUntil = 0
             local smoothFaceWindowTurnBudget = 0
+            local smoothFaceSnapPending = false
 
             local function SmoothFaceRestoreAutoRotate()
                 if not smoothFaceWasApplied then
@@ -7346,6 +7409,8 @@ local function BolongHub()
                 smoothFaceTargetCharacter = killerCharacter
                 smoothFaceWindowUntil = now + window
                 smoothFaceWindowTurnBudget = SMOOTH_FACE_MAX_WINDOW_TURN
+                -- Face the attack source on the very first frame of the swing.
+                smoothFaceSnapPending = true
             end
 
             local function SmoothFaceTarget()
@@ -7481,27 +7546,35 @@ local function BolongHub()
                     return
                 end
 
-                -- "Face Smoothness" drives the turn rate cap: higher value reacts
-                -- faster. Clamped so a swing still cannot snap around instantly.
-                local smoothness = math.clamp(
-                    tonumber(State.autoParryFaceSmoothness) or SMOOTH_FACE_SMOOTHNESS_REF,
-                    2, 30)
-                local maxRate = math.clamp(
-                    SMOOTH_FACE_MAX_TURN_RATE * (smoothness / SMOOTH_FACE_SMOOTHNESS_REF),
-                    180, 1440)
+                -- "Seketika" reaction: on the first frame of the swing the survivor
+                -- turns straight to the attack source. yawError is already
+                -- shortest-path wrapped to +/-180 deg, so this lands exactly on the
+                -- attacker and can never degenerate into a 360 spin.
+                local step = yawError
+                if not smoothFaceSnapPending then
+                    -- After the snap, keep tracking the attacker under the
+                    -- "Face Smoothness" rate cap so a long wind-up still follows
+                    -- the killer, without ever spinning.
+                    local smoothness = math.clamp(
+                        tonumber(State.autoParryFaceSmoothness) or SMOOTH_FACE_SMOOTHNESS_REF,
+                        2, 30)
+                    local maxRate = math.clamp(
+                        SMOOTH_FACE_MAX_TURN_RATE * (smoothness / SMOOTH_FACE_SMOOTHNESS_REF),
+                        180, 1440)
+                    local rateStep = math.rad(maxRate) * math.clamp(dt or 0, 0, 0.1)
+                    if math.abs(step) > rateStep then
+                        step = rateStep * (step >= 0 and 1 or -1)
+                    end
 
-                local step = math.rad(maxRate) * math.clamp(dt or 0, 0, 0.1)
-                if step > math.abs(yawError) then
-                    step = yawError
+                    -- Hard budget per reaction window: the sustained tracking phase
+                    -- can never turn the survivor further than
+                    -- SMOOTH_FACE_MAX_WINDOW_TURN degrees, no matter how long the
+                    -- window stays open.
+                    if math.abs(step) > smoothFaceWindowTurnBudget then
+                        step = (step > 0 and 1 or -1) * math.max(0, smoothFaceWindowTurnBudget)
+                    end
+                    smoothFaceWindowTurnBudget = smoothFaceWindowTurnBudget - math.abs(step)
                 end
-
-                -- Hard budget per reaction window: a single swing can never turn
-                -- the survivor further than SMOOTH_FACE_MAX_WINDOW_TURN degrees,
-                -- no matter how long the window stays open.
-                if math.abs(step) > smoothFaceWindowTurnBudget then
-                    step = (step > 0 and 1 or -1) * math.max(0, smoothFaceWindowTurnBudget)
-                end
-                smoothFaceWindowTurnBudget = smoothFaceWindowTurnBudget - math.abs(step)
 
                 if math.abs(step) > 0 then
                     pcall(function()
@@ -7509,10 +7582,12 @@ local function BolongHub()
                     end)
                 end
 
-                if smoothFaceWindowTurnBudget <= 0 then
+                if not smoothFaceSnapPending and smoothFaceWindowTurnBudget <= 0 then
                     smoothFaceWindowUntil = 0
                     SmoothFaceRestoreAutoRotate()
                 end
+
+                smoothFaceSnapPending = false
             end
 
 
@@ -7780,6 +7855,120 @@ local function BolongHub()
             if State.parryRadiusEspEnabled then
                 fn_ParryHelper_6254(true)
             end
+
+            ----------------------------------------------------------------------
+            -- SIGHT CONE
+            -- Ported from main (9).lua ("ZINKA_Cone"). A neon arc drawn on the
+            -- ground in front of the killer showing the direction they face, so
+            -- you can read whether they can see you.
+            ----------------------------------------------------------------------
+            local SIGHT_CONE_RADIUS = 8
+            local SIGHT_CONE_HALF_ANGLE = math.rad(110)
+            local SIGHT_CONE_EDGE = 0.5
+            local SIGHT_CONE_GAP = 0.5
+            local SIGHT_CONE_COLOR = Color3.fromRGB(235, 70, 90)
+
+            local sightConeModel = Instance.new("Model")
+            sightConeModel.Name = "Bolong_SightCone"
+            local sightConeParts = {}
+
+            local function sightConeNewPart()
+                local part = Instance.new("Part")
+                part.Anchored = true
+                part.CanCollide = false
+                part.CanQuery = false
+                part.CanTouch = false
+                part.Material = Enum.Material.Neon
+                part.Color = SIGHT_CONE_COLOR
+                part.Transparency = 0.15
+                part.CastShadow = false
+                part.Parent = sightConeModel
+                return part
+            end
+
+            local function cleanupSightCone()
+                for _, part in ipairs(sightConeParts) do
+                    pcall(function() part:Destroy() end)
+                end
+                table.clear(sightConeParts)
+
+                local halfAngle = SIGHT_CONE_HALF_ANGLE / 2
+
+                -- two straight edges running out from the killer
+                for _, edgeAngle in ipairs({ -halfAngle, halfAngle }) do
+                    local edgeDir = Vector3.new(math.sin(edgeAngle), 0, math.cos(edgeAngle))
+                    local edgeCount = math.max(3, math.floor(SIGHT_CONE_RADIUS / (SIGHT_CONE_EDGE + SIGHT_CONE_GAP)))
+                    for index = 0, edgeCount - 1 do
+                        local segStart = index * (SIGHT_CONE_EDGE + SIGHT_CONE_GAP) + 0.3
+                        local segEnd = math.min(segStart + SIGHT_CONE_EDGE, SIGHT_CONE_RADIUS)
+                        if segEnd > segStart then
+                            local part = sightConeNewPart()
+                            part.Size = Vector3.new(0.32, 0.06, segEnd - segStart)
+                            part.CFrame = CFrame.lookAt(edgeDir * ((segStart + segEnd) / 2), Vector3.new(0, 0, 0))
+                            table.insert(sightConeParts, part)
+                        end
+                    end
+                end
+
+                -- the arc across the far end
+                local arcLength = SIGHT_CONE_HALF_ANGLE * SIGHT_CONE_RADIUS
+                local segStep = SIGHT_CONE_EDGE + SIGHT_CONE_GAP
+                local arcCount = math.max(6, math.floor(arcLength / segStep))
+                for index = 0, arcCount - 1 do
+                    local arcStart = -halfAngle + (index * segStep) / SIGHT_CONE_RADIUS
+                    local arcEnd = math.min(-halfAngle + ((index * segStep) + SIGHT_CONE_EDGE) / SIGHT_CONE_RADIUS, halfAngle)
+                    if arcEnd > arcStart then
+                        local midAngle = (arcStart + arcEnd) / 2
+                        local arcDir = Vector3.new(math.sin(midAngle), 0, math.cos(midAngle))
+                        local arcPos = arcDir * SIGHT_CONE_RADIUS
+                        local part = sightConeNewPart()
+                        part.Size = Vector3.new((arcEnd - arcStart) * SIGHT_CONE_RADIUS, 0.06, 0.7)
+                        part.CFrame = CFrame.lookAt(
+                            arcPos,
+                            arcPos + Vector3.new(math.sin(midAngle + 0.001), 0, math.cos(midAngle + 0.001)))
+                        table.insert(sightConeParts, part)
+                    end
+                end
+
+                sightConeModel.WorldPivot = CFrame.new(0, 0, 0)
+            end
+
+            cleanupSightCone()
+
+            -- The loop always runs and self-gates on State.killerSightConeEnabled,
+            -- so the Visual > Killer ESP menu only has to flip one flag.
+            RunService.Heartbeat:Connect(function()
+                -- Survivors only: the cone tells a survivor where the killer is
+                -- looking, so hide it when playing as killer.
+                if (not State.killerSightConeEnabled)
+                    or (LocalPlayer.Team and LocalPlayer.Team.Name == "Killer") then
+                    if sightConeModel.Parent then
+                        sightConeModel.Parent = nil
+                    end
+                    return
+                end
+
+                local killerModel = FindKillerModel()
+                local killerRoot = killerModel and killerModel:FindFirstChild("HumanoidRootPart")
+                local killerHumanoid = killerModel and killerModel:FindFirstChildOfClass("Humanoid")
+                if not killerRoot or (not killerHumanoid) or killerHumanoid.Health <= 0 then
+                    if sightConeModel.Parent then
+                        sightConeModel.Parent = nil
+                    end
+                    return
+                end
+
+                if not sightConeModel.Parent then
+                    sightConeModel.Parent = WorkspaceService
+                end
+
+                local killerLook = killerRoot.CFrame.LookVector
+                local killerYaw = math.atan2(killerLook.X, killerLook.Z)
+                local coneY = killerRoot.Position.Y - 1.6
+                sightConeModel:PivotTo(
+                    CFrame.new(Vector3.new(killerRoot.Position.X, coneY, killerRoot.Position.Z))
+                        * CFrame.Angles(0, killerYaw, 0))
+            end)
         end
 
         local function fn_ServerHandler_b0c3()
@@ -11944,7 +12133,10 @@ local function BolongHub()
                 end,
             })
             var_section_2baa.AddSlider(var_section_2baa,{
-                Title = "Parry Radius (Stud)", Min = 4, Max = 40, Default = (11.0), Increment = 1,
+                -- Min is 5 so it matches AUTO_PARRY_TRIGGER_RANGE_MIN: below that
+                -- the trigger clamp would raise the value back up and the ring
+                -- would draw a smaller circle than the parry actually reaches.
+                Title = "Parry Radius (Stud)", Min = 5, Max = 40, Default = (11.0), Increment = 1,
                 Callback = function(var_value_d1f9)
                     State.parryRadius = var_value_d1f9
                 end,
@@ -12835,6 +13027,13 @@ local function BolongHub()
                 Title = "Killer Color", Default = Config.cfg_showName_957b,
                 Callback = function(color) Config.cfg_showName_957b = color
                 fn_GetHandler_d1b6() end,
+            })
+            var_section_2a91.AddToggle(var_section_2a91,{
+                -- Sight cone from main (9).lua: draws the arc the killer is facing.
+                Title = "Sight Cone", Default = false,
+                Callback = function(var_value_d1f9)
+                    State.killerSightConeEnabled = var_value_d1f9
+                end,
             })
 
     -- ============================================================
