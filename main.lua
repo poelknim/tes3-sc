@@ -6898,7 +6898,7 @@ local function BolongHub()
             -- How many ms before the calculated hit point to trigger the parry.
             -- main (9).lua uses ZinkaValues.ParryWindow (default 140ms).
             -- Larger value = earlier parry = safer but more obvious.
-            local AUTO_PARRY_WINDOW_MS = 140
+            local AUTO_PARRY_WINDOW_MS = 100
             -- Upper safety clamp on how early the delay can be; matches
             -- main (9).lua's  remaining - LOCK*0.7  (0.8*0.7 = 0.56).
             local AUTO_PARRY_LOCK = 0.8
