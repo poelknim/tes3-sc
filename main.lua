@@ -19,6 +19,7 @@ local function BolongHub()
         local Players             = game:GetService("Players")
         local RunService          = game:GetService("RunService")
         local UserInputService    = game:GetService("UserInputService")
+        local ContextActionService = game:GetService("ContextActionService")
         local VirtualInputManager = game:GetService("VirtualInputManager")
         local VirtualUser         = game:GetService("VirtualUser")
         local GuiService          = game:GetService("GuiService")
@@ -154,6 +155,7 @@ local function BolongHub()
             -- Rage enables the RenderStepped instant-fire poll (baris 5541-5572).
             autoParryRageMode = true,
             autoParryMobileButton = false,
+            autoParryBind = Enum.KeyCode.P,
             var_originalValue_b002  = (0.0),
             state_unhookYourself_d58e      = {},
             state_unhookYourself_c84b = {},
@@ -3012,6 +3014,31 @@ local function BolongHub()
                         pcall(function() stockCounter.Visible = false end)
                     end
 
+                    local nameContainer = nameLabel.Parent
+                    if not (nameContainer and nameContainer:IsA("GuiObject")) then
+                        Hide()
+                        return
+                    end
+
+                    local nameBottom = nameLabel.AbsolutePosition.Y + nameLabel.AbsoluteSize.Y
+                    local lowerBoundary = slot.AbsolutePosition.Y + slot.AbsoluteSize.Y
+                    for _, inst in ipairs(slot:GetDescendants()) do
+                        if inst:IsA("GuiObject") and inst ~= nameLabel then
+                            local position, size = inst.AbsolutePosition, inst.AbsoluteSize
+                            local isDivider = size.Y <= 4 and size.X >= nameLabel.AbsoluteSize.X * 0.5
+                            if isDivider and position.Y >= nameBottom and position.Y < lowerBoundary then
+                                lowerBoundary = position.Y
+                            end
+                        end
+                    end
+
+                    local gap = lowerBoundary - nameBottom
+                    local counterHeight = math.min(18, math.floor(gap - 2))
+                    if counterHeight < 12 then
+                        Hide()
+                        return
+                    end
+
                     if not counter then
                         counter = Instance.new("TextLabel")
                         counter.Name = label
@@ -3023,15 +3050,16 @@ local function BolongHub()
                         counter.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
                         counter.TextStrokeTransparency = 0
                         counter.TextScaled = true
-                        -- Absolute, anchored to the bottom of the slot so it lands
-                        -- in the same place no matter how the roster is nested.
-                        counter.AnchorPoint = Vector2.new(0, 1)
-                        counter.Position = UDim2.new(0, 0, 1, 0)
-                        counter.Size = UDim2.new(1, 0, 0, 18)
                         counter.ZIndex = 50
-                        counter.Parent = slot
                     end
 
+                    counter.Parent = nameContainer
+                    counter.AnchorPoint = Vector2.zero
+                    counter.Position = UDim2.fromOffset(
+                        nameLabel.AbsolutePosition.X - nameContainer.AbsolutePosition.X,
+                        nameBottom - nameContainer.AbsolutePosition.Y + 1
+                    )
+                    counter.Size = UDim2.fromOffset(nameLabel.AbsoluteSize.X, counterHeight)
                     counter.Visible = true
 
                     if hooks >= 3 then
@@ -6997,37 +7025,128 @@ local function BolongHub()
 
         local fn_ParryHelper_6254
         do
-            ----------------------------------------------------------------------
-            -- AUTO PARRY TOGGLE (PC keybind + mobile GUI button)
-            --
-            -- Both entry points route through ToggleAutoParry so the shared state
-            -- reset and the on-screen indicator can never drift apart from
-            -- State.autoParryEnabled.
-            ----------------------------------------------------------------------
             local ToggleAutoParry
+            local SetAutoParryEnabled
             local PaintAutoParryButton
             local RefreshAutoParryButton
             local CreateAutoParryButton
-
+            local PositionAutoParryButton
             local autoParryButtonGui = nil
             local autoParryButtonImage = nil
+            local autoParryBindGui = nil
+            local autoParryBindButton = nil
+            local autoParryCapturingBind = false
+            local AUTO_PARRY_BIND_ACTION = "BolongHubAutoParryToggle"
 
-            -- Visual state of the mobile button: green when parry is armed,
-            -- dim grey when off.
+            local function ResolveNativeParryButton(playerGui)
+                local camera = workspace.CurrentCamera
+                if not (playerGui and camera) then return nil end
+                local viewport = camera.ViewportSize
+                local best, bestScore = nil, -math.huge
+                for _, button in ipairs(playerGui:GetDescendants()) do
+                    local ownControl = button == autoParryButtonImage or button.Name == "AutoParryToggleBtn" or (autoParryButtonGui and button:IsDescendantOf(autoParryButtonGui))
+                    if button:IsA("GuiButton") and not ownControl and button.Visible and button.AbsoluteSize.X > 28 and button.AbsoluteSize.Y > 28 then
+                        local position, size = button.AbsolutePosition, button.AbsoluteSize
+                        local centerX = (position.X + size.X / 2) / math.max(viewport.X, 1)
+                        local centerY = (position.Y + size.Y / 2) / math.max(viewport.Y, 1)
+                        local ratio = size.X / math.max(size.Y, 1)
+                        local name = string.lower(button.Name)
+                        local ancestry = ""
+                        for ancestor = button.Parent, nil do ancestry = ancestry .. " " .. string.lower(ancestor.Name) end
+                        local inSurvivorControls = string.find(ancestry, "survivor%-mob") and string.find(ancestry, "controls", 1, true)
+                        local rejectedName = string.find(name, "run", 1, true) or string.find(name, "crouch", 1, true) or string.find(name, "toolbar", 1, true) or string.find(name, "item", 1, true) or string.find(name, "slot", 1, true) or string.find(name, "top", 1, true) or string.find(name, "upper", 1, true)
+                        local rejectedHierarchy = string.find(ancestry, "toolbar", 1, true) or string.find(ancestry, "item", 1, true) or string.find(ancestry, "slot", 1, true) or string.find(ancestry, "top", 1, true) or string.find(ancestry, "upper", 1, true) or string.find(ancestry, "run", 1, true) or string.find(ancestry, "crouch", 1, true)
+                        local namedParry = string.find(name, "attack", 1, true) or string.find(name, "parry", 1, true) or string.find(name, "sword", 1, true) or string.find(name, "dagger", 1, true)
+                        local guiMob = name == "gui-mob"
+                        local nearSquare = ratio >= 0.72 and ratio <= 1.38
+                        if centerX >= 0.55 and centerY >= 0.32 and inSurvivorControls and nearSquare and not rejectedName and not rejectedHierarchy and (namedParry or guiMob) then
+                            local score = (namedParry and 100 or 0) + (button:IsA("ImageButton") and 20 or 0) + (centerX * 10) + (centerY * 10)
+                            if score > bestScore then best, bestScore = button, score end
+                        end
+                    end
+                end
+                return best
+            end
+
+            local function FindControlButtons(playerGui)
+                local buttons = {}
+                for _, descendant in ipairs(playerGui:GetDescendants()) do
+                    local isAutoParryControl = descendant == autoParryButtonImage or descendant.Name == "AutoParryToggleBtn" or (autoParryButtonGui and descendant:IsDescendantOf(autoParryButtonGui))
+                    if descendant:IsA("GuiButton") and not isAutoParryControl then
+                        local name = string.lower(descendant.Name)
+                        if name == "gui-mob" or name == "run" or name == "crouch" or string.find(name, "parry", 1, true) then
+                            table.insert(buttons, descendant)
+                        end
+                    end
+                end
+                return buttons
+            end
+
+            PositionAutoParryButton = function()
+                if not autoParryButtonImage or not autoParryButtonImage.Parent then return end
+                local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+                local camera = workspace.CurrentCamera
+                local parry = playerGui and ResolveNativeParryButton(playerGui)
+                if not parry or parry.AbsoluteSize.X <= 0 or parry.AbsoluteSize.Y <= 0 or not camera then
+                    autoParryButtonImage.Visible = false
+                    return
+                end
+                local viewport = camera.ViewportSize
+                local size = math.max(52, math.min(parry.AbsoluteSize.X, parry.AbsoluteSize.Y))
+                local gap = 12
+                local parryPosition, parrySize = parry.AbsolutePosition, parry.AbsoluteSize
+                local candidates = {
+                    Vector2.new(parryPosition.X - size - gap, parryPosition.Y + (parrySize.Y - size) / 2),
+                    Vector2.new(parryPosition.X - size - gap, parryPosition.Y - size - gap),
+                    Vector2.new(parryPosition.X + (parrySize.X - size) / 2, parryPosition.Y - size - gap),
+                    Vector2.new(parryPosition.X + parrySize.X + gap, parryPosition.Y - size - gap),
+                }
+                local controls = FindControlButtons(playerGui)
+                local target
+                for _, candidate in ipairs(candidates) do
+                    local inViewport = candidate.X >= 0 and candidate.Y >= 0 and candidate.X + size <= viewport.X and candidate.Y + size <= viewport.Y
+                    local safe = inViewport
+                    if safe then
+                        for _, control in ipairs(controls) do
+                            local position, controlSize = control.AbsolutePosition, control.AbsoluteSize
+                            if candidate.X < position.X + controlSize.X + gap and candidate.X + size + gap > position.X and candidate.Y < position.Y + controlSize.Y + gap and candidate.Y + size + gap > position.Y then
+                                safe = false
+                                break
+                            end
+                        end
+                    end
+                    if safe then
+                        target = candidate
+                        break
+                    end
+                end
+                if not target then
+                    autoParryButtonImage.Visible = false
+                    return
+                end
+                autoParryButtonImage.Size = UDim2.fromOffset(size, size)
+                autoParryButtonImage.AnchorPoint = Vector2.zero
+                autoParryButtonImage.Position = UDim2.fromOffset(target.X, target.Y)
+                autoParryButtonImage.Visible = true
+            end
+
             PaintAutoParryButton = function()
                 if not autoParryButtonImage then return end
                 pcall(function()
-                    autoParryButtonImage.ImageTransparency = State.autoParryEnabled and 0.1 or 0.65
-                    autoParryButtonImage.ImageColor3 = State.autoParryEnabled
-                        and Color3.fromRGB(120, 255, 140)
-                        or Color3.fromRGB(190, 190, 190)
+                    local enabled = State.autoParryEnabled
+                    local opacity = enabled and 0 or 0.67
+                    if autoParryButtonImage:IsA("ImageButton") then
+                        autoParryButtonImage.ImageTransparency = opacity
+                    end
+                    autoParryButtonImage.BackgroundTransparency = opacity
+                    local stroke = autoParryButtonImage:FindFirstChild("AutoParryStroke")
+                    if stroke and stroke:IsA("UIStroke") then stroke.Transparency = enabled and 0.08 or 0.67 end
                 end)
             end
 
-            ToggleAutoParry = function()
-                State.autoParryEnabled = not State.autoParryEnabled
+            SetAutoParryEnabled = function(enabled)
+                State.autoParryEnabled = enabled and true or false
                 if not State.autoParryEnabled then
-                    -- Same cleanup the Auto Parry menu toggle does.
                     State.state_unhookYourself_bfd8 = {}
                     State.state_unhookYourself_d58e = {}
                     State.state_unhookYourself_c84b = {}
@@ -7038,129 +7157,175 @@ local function BolongHub()
                     end)
                 end
                 RefreshAutoParryButton()
-                if State.autoParryDebug then
-                    Notify("Auto Parry", State.autoParryEnabled and "ENABLED" or "DISABLED", 2)
+                if State.autoParryMenuToggle and not State.autoParryMenuChanged then
+                    State.autoParryMenuChanged = true
+                    pcall(function() State.autoParryMenuToggle:Set(State.autoParryEnabled) end)
+                    State.autoParryMenuChanged = false
                 end
+                if State.autoParryDebug then Notify("Auto Parry", State.autoParryEnabled and "ENABLED" or "DISABLED", 2) end
                 return State.autoParryEnabled
             end
+            ToggleAutoParry = function() return SetAutoParryEnabled(not State.autoParryEnabled) end
+            State.SetAutoParryEnabled = SetAutoParryEnabled
             State.ToggleAutoParry = ToggleAutoParry
             State.PaintAutoParryButton = PaintAutoParryButton
 
+            local function GetAutoParryBindLabel()
+                local bind = State.autoParryBind
+                if bind == Enum.UserInputType.MouseButton1 then return "LMB" end
+                if bind == Enum.UserInputType.MouseButton2 then return "RMB" end
+                if bind == Enum.UserInputType.MouseButton3 then return "MMB" end
+                return bind and bind.Name or "None"
+            end
+
+            local function RefreshAutoParryBindField(text)
+                if autoParryBindGui then autoParryBindGui.Enabled = autoParryCapturingBind or text ~= nil end
+                if autoParryBindButton then
+                    autoParryBindButton.Text = text or "Press key or mouse..."
+                end
+            end
+
+            local function BeginAutoParryBindCapture()
+                autoParryCapturingBind = true
+                RefreshAutoParryBindField()
+            end
+
+            local function CreateAutoParryBindField()
+                if autoParryBindGui and autoParryBindGui.Parent then return end
+                local gui = Instance.new("ScreenGui")
+                gui.Name, gui.ResetOnSpawn, gui.IgnoreGuiInset = "BolongHubAutoParryBind", false, true
+                gui.DisplayOrder = 100
+                gui.Enabled = false
+                gui.Parent = PlayerGui
+                local button = Instance.new("TextButton")
+                button.Name, button.Size, button.Position = "AutoParryBindPrompt", UDim2.fromOffset(190, 32), UDim2.new(0.5, -95, 0.5, -16)
+                button.BackgroundColor3, button.BackgroundTransparency = Color3.fromRGB(28, 28, 36), 0.15
+                button.TextColor3, button.TextSize, button.Font = Color3.fromRGB(235, 235, 235), 14, Enum.Font.GothamMedium
+                button.Active = false
+                button.Parent = gui
+                local corner = Instance.new("UICorner")
+                corner.CornerRadius, corner.Parent = UDim.new(0, 7), button
+                autoParryBindGui, autoParryBindButton = gui, button
+            end
+
+            CreateAutoParryBindField()
+            State.BeginAutoParryBindCapture = BeginAutoParryBindCapture
+            if State.autoParryBindConnection then pcall(function() State.autoParryBindConnection:Disconnect() end) end
+            local autoParryBindIgnoreUntil = 0
+            local autoParryBindLastAt = 0
+
+            -- ContextActionService is preferred, but some executors/game control
+            -- layers consume keyboard or mouse input before CAS delivers it. This
+            -- shared trigger is deliberately used by BOTH CAS and InputBegan: one
+            -- 0.20s debounce prevents a duplicate toggle while guaranteeing the
+            -- captured P/LMB/RMB/MMB bind still works through the fallback path.
+            local function TriggerAutoParryBind(input, alreadyMatched)
+                if autoParryCapturingBind or tick() < autoParryBindIgnoreUntil
+                    or UserInputService:GetFocusedTextBox() then
+                    return nil
+                end
+                local bind = State.autoParryBind
+                if not bind then return nil end
+                if not alreadyMatched and (not input or (input.KeyCode ~= bind and input.UserInputType ~= bind)) then
+                    return nil
+                end
+                local now = tick()
+                if now - autoParryBindLastAt < 0.20 then return nil end
+                autoParryBindLastAt = now
+                local enabled = ToggleAutoParry()
+                Notify("Auto Parry", "Keybind " .. GetAutoParryBindLabel() .. ": " .. (enabled and "ENABLED" or "DISABLED"), 2)
+                return enabled
+            end
+
+            local function RebindAutoParryAction()
+                ContextActionService:UnbindAction(AUTO_PARRY_BIND_ACTION)
+                local bind = State.autoParryBind
+                if not bind then return end
+                ContextActionService:BindActionAtPriority(AUTO_PARRY_BIND_ACTION, function(_, inputState)
+                    if inputState ~= Enum.UserInputState.Begin then
+                        return Enum.ContextActionResult.Pass
+                    end
+                    if TriggerAutoParryBind(nil, true) ~= nil then
+                        return Enum.ContextActionResult.Sink
+                    end
+                    return Enum.ContextActionResult.Pass
+                end, false, Enum.ContextActionPriority.High.Value, bind)
+            end
+            RebindAutoParryAction()
+            State.autoParryBindConnection = UserInputService.InputBegan:Connect(function(input)
+                if not autoParryCapturingBind then
+                    -- Fallback for inputs intercepted before ContextActionService.
+                    TriggerAutoParryBind(input, false)
+                    return
+                end
+                local captured = false
+                if input.KeyCode == Enum.KeyCode.Escape then
+                    autoParryCapturingBind = false
+                elseif input.KeyCode == Enum.KeyCode.Backspace or input.KeyCode == Enum.KeyCode.Delete then
+                    State.autoParryBind, autoParryCapturingBind = nil, false
+                    Notify("Auto Parry", "Toggle Keybind: cleared", 2)
+                elseif input.UserInputType == Enum.UserInputType.Keyboard then
+                    State.autoParryBind, autoParryCapturingBind, captured = input.KeyCode, false, true
+                elseif input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.MouseButton2 or input.UserInputType == Enum.UserInputType.MouseButton3 then
+                    State.autoParryBind, autoParryCapturingBind, captured = input.UserInputType, false, true
+                end
+                if captured then
+                    autoParryBindIgnoreUntil = tick() + 0.2
+                    RebindAutoParryAction()
+                    Notify("Auto Parry", "Toggle Keybind: " .. GetAutoParryBindLabel(), 2)
+                elseif not autoParryCapturingBind then
+                    RebindAutoParryAction()
+                end
+                RefreshAutoParryBindField()
+            end)
+
             RefreshAutoParryButton = function()
                 if not State.autoParryMobileButton then
-                    if autoParryButtonGui then
-                        autoParryButtonGui:Destroy()
-                        autoParryButtonGui = nil
-                        autoParryButtonImage = nil
-                    end
+                    if autoParryButtonGui then autoParryButtonGui:Destroy() end
+                    autoParryButtonGui, autoParryButtonImage = nil, nil
                     return
                 end
-                if autoParryButtonGui then
-                    PaintAutoParryButton()
-                    return
-                end
-                CreateAutoParryButton()
+                if autoParryButtonGui and autoParryButtonGui.Parent then PaintAutoParryButton(); PositionAutoParryButton() else CreateAutoParryButton() end
             end
             State.RefreshAutoParryButton = RefreshAutoParryButton
 
             CreateAutoParryButton = function()
                 if autoParryButtonGui then return true end
-
                 local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
-                if not playerGui then
-                    -- PlayerGui can arrive late; retry a few times before giving up.
-                    task.spawn(function()
-                        for _ = 1, 20 do
-                            task.wait(0.5)
-                            if not State.autoParryMobileButton then return end
-                            if CreateAutoParryButton() then return end
-                        end
-                    end)
-                    return false
-                end
-
-                -- Anchor next to the survivor crouch button when it exists, so the
-                -- toggle sits where a mobile player already expects their controls.
-                local anchorPos = UDim2.new(1, -150, 1, -150)
-                pcall(function()
-                    local mob = playerGui:FindFirstChild("Survivor-mob")
-                    local controls = mob and mob:FindFirstChild("Controls")
-                    local crouch = controls and controls:FindFirstChild("crouch")
-                    if crouch and crouch:IsA("GuiButton") then
-                        anchorPos = UDim2.new(
-                            crouch.Position.X.Scale,
-                            crouch.Position.X.Offset + 100,
-                            crouch.Position.Y.Scale,
-                            crouch.Position.Y.Offset
-                        )
-                    end
-                end)
-
+                local native = playerGui and ResolveNativeParryButton(playerGui)
+                if not native then return false end
                 local gui = Instance.new("ScreenGui")
-                gui.Name = "BolongHubAutoParryToggle"
-                gui.ResetOnSpawn = false
-                gui.IgnoreGuiInset = true
+                local nativeGui = native:FindFirstAncestorWhichIsA("ScreenGui")
+                gui.Name, gui.ResetOnSpawn, gui.IgnoreGuiInset = "BolongHubAutoParryToggle", false, true
+                gui.DisplayOrder = math.max(1, (nativeGui and nativeGui.DisplayOrder or 0) + 1)
                 gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
                 gui.Parent = playerGui
-
-                local button = Instance.new("ImageButton")
-                button.Name = "AutoParryToggleBtn"
-                button.BackgroundTransparency = 1
-                button.BorderSizePixel = 0
-                button.AutoButtonColor = false
-                button.Size = UDim2.fromOffset(76, 76)
-                -- Same icon as the GenBoost button so the set looks consistent.
-                button.Image = "rbxassetid://129980991442403"
-                button.AnchorPoint = Vector2.new(1, 0.5)
-                button.Position = anchorPos
-                button.Draggable = false
-                button.ZIndex = 60
+                local button = native:Clone()
+                for _, descendant in ipairs(button:GetDescendants()) do
+                    if descendant:IsA("LocalScript") or descendant:IsA("Script") then descendant:Destroy() end
+                end
+                button.Name, button.AutoButtonColor, button.Visible = "AutoParryToggleBtn", false, true
+                button.ZIndex = native.ZIndex + 10
                 button.Parent = gui
-
-                local caption = Instance.new("TextLabel")
-                caption.Name = "Caption"
-                caption.BackgroundTransparency = 1
-                caption.BorderSizePixel = 0
-                caption.Size = UDim2.fromOffset(76, 16)
-                caption.Position = UDim2.fromOffset(0, 60)
-                caption.Font = Enum.Font.SourceSansBold
-                caption.TextScaled = true
-                caption.TextColor3 = Color3.fromRGB(255, 255, 255)
-                caption.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
-                caption.TextStrokeTransparency = 0
-                caption.Text = "AP"
-                caption.ZIndex = 60
-                caption.Parent = button
-
-                -- MouseButton1Click fires for touch as well as mouse, so one
-                -- handler covers both platforms.
-                button.MouseButton1Click:Connect(function()
-                    ToggleAutoParry()
-                    button.ImageColor3 = State.autoParryEnabled
-                        and Color3.fromRGB(120, 255, 140)
-                        or Color3.fromRGB(255, 90, 90)
-                    task.delay(0.25, PaintAutoParryButton)
-                end)
-
-                autoParryButtonGui = gui
-                autoParryButtonImage = button
+                local stroke = Instance.new("UIStroke")
+                stroke.Name, stroke.Thickness, stroke.ApplyStrokeMode = "AutoParryStroke", 2, Enum.ApplyStrokeMode.Border
+                stroke.Color = Color3.fromRGB(100, 255, 135)
+                stroke.Parent = button
+                local gradient = Instance.new("UIGradient")
+                gradient.Color = ColorSequence.new(Color3.fromRGB(45, 170, 80), Color3.fromRGB(150, 255, 170))
+                gradient.Rotation = 45
+                gradient.Parent = stroke
+                button.Activated:Connect(ToggleAutoParry)
+                autoParryButtonGui, autoParryButtonImage = gui, button
                 PaintAutoParryButton()
+                task.defer(PositionAutoParryButton)
                 return true
             end
             State.CreateAutoParryButton = CreateAutoParryButton
 
-            -- The game's mobile GUI is rebuilt on role change / respawn, and our
-            -- ScreenGui lives outside it, so re-assert the button periodically.
-            -- Cheap: only touches PlayerGui when the toggle is on.
-            RegisterTask("AutoParryButton", 2.0, function()
+            RegisterTask("AutoParryButton", 1.0, function()
                 if not State.autoParryMobileButton then return end
-                if autoParryButtonGui and autoParryButtonGui.Parent then
-                    PaintAutoParryButton()
-                    return
-                end
-                autoParryButtonGui = nil
-                autoParryButtonImage = nil
-                CreateAutoParryButton()
+                if not (autoParryButtonGui and autoParryButtonGui.Parent) then autoParryButtonGui, autoParryButtonImage = nil, nil; CreateAutoParryButton() else PaintAutoParryButton(); PositionAutoParryButton() end
             end)
 
             ----------------------------------------------------------------------
@@ -7413,10 +7578,11 @@ local function BolongHub()
 
                 if not fired then
                     pcall(function()
-                        local survivorGui = PlayerGui:FindFirstChild("Survivor-mob")
-                        local controls = survivorGui and survivorGui:FindFirstChild("Controls")
-                        local mobileButton = controls and controls:FindFirstChild("Gui-mob")
-                        if mobileButton and mobileButton:IsA("ImageButton") and typeof(firesignal) == "function" then
+                        -- Use the same qualified right-side survivor-control resolver
+                        -- as the custom HUD clone. Never fall back to the first
+                        -- Gui-mob, which can be the unrelated purple top-left item.
+                        local mobileButton = ResolveNativeParryButton(PlayerGui)
+                        if mobileButton and mobileButton:IsA("GuiButton") and typeof(firesignal) == "function" then
                             firesignal(mobileButton.MouseButton1Down)
                             task.defer(function()
                                 if mobileButton.Parent then
@@ -7740,6 +7906,10 @@ local function BolongHub()
                 end
             end
 
+            -- Forward declaration: SmoothFaceArm uses this guard before its body
+            -- is assigned later in the same lexical scope.
+            local SmoothFaceRotationLocked
+
             -- Called from the killer animation handler, i.e. only when the
             -- killer actually performs a hit action.
             local function SmoothFaceArm(killerCharacter, track)
@@ -7810,7 +7980,7 @@ local function BolongHub()
 
             -- True whenever the local survivor's transform is owned by the game
             -- or by the killer (knock / carry / hook / seat / death).
-            local function SmoothFaceRotationLocked(character, humanoid, root, killerCharacter)
+            SmoothFaceRotationLocked = function(character, humanoid, root, killerCharacter)
                 if not character or not humanoid or not root then
                     return true
                 end
@@ -8119,6 +8289,13 @@ local function BolongHub()
 
             ----------------------------------------------------------------------
             -- PARRY RADIUS ESP (ZINKA STYLE)
+            --
+            -- Separate synchronous function scope. This releases every ring-local
+            -- register before the enclosing Auto Parry block reaches its remaining
+            -- code. `task.spawn` alone was not sufficient because the Radius ESP
+            -- locals themselves were still declared in the oversized parent scope.
+            ----------------------------------------------------------------------
+            ;(function()
             -- Visual ring only. It does not participate in parry decisions.
             -- The configured State.parryRadius is used as the ring radius.
             --
@@ -8284,13 +8461,17 @@ local function BolongHub()
             if State.parryRadiusEspEnabled then
                 fn_ParryHelper_6254(true)
             end
+            end)()
 
             ----------------------------------------------------------------------
             -- SIGHT CONE
-            -- Ported from main (9).lua ("ZINKA_Cone"). A neon arc drawn on the
-            -- ground in front of the killer showing the direction they face, so
-            -- you can read whether they can see you.
+            --
+            -- Keep this in its own spawned function scope. The Auto Parry block is
+            -- already close to Luau's 200-local-register compiler ceiling; keeping
+            -- the cone's constants, model and part cache in that same scope caused
+            -- `Out of local registers ... sightConeParts` at compile time.
             ----------------------------------------------------------------------
+            task.spawn(function()
             local SIGHT_CONE_RADIUS = 8
             local SIGHT_CONE_HALF_ANGLE = math.rad(110)
             local SIGHT_CONE_EDGE = 0.5
@@ -8397,6 +8578,7 @@ local function BolongHub()
                 sightConeModel:PivotTo(
                     CFrame.new(Vector3.new(killerRoot.Position.X, coneY, killerRoot.Position.Z))
                         * CFrame.Angles(0, killerYaw, 0))
+            end)
             end)
         end
 
@@ -12538,26 +12720,18 @@ local function BolongHub()
                 Callback = function(var_value_d1f9) fn_GetHandler_71fb(var_value_d1f9) end,
             })
             local var_section_2baa = ExclusiveTab.AddSection(ExclusiveTab,"Auto Parry", nil)
-            local var_section_4eef = var_section_2baa.AddHStack(var_section_2baa)
-            var_section_4eef.AddToggle(var_section_4eef,{
+            State.autoParryMenuToggle = var_section_2baa.AddToggle(var_section_2baa,{
                 Title = "Auto Parry", Default = false,
                 Callback = function(var_value_d1f9)
-                    State.autoParryEnabled = var_value_d1f9
-                    if not var_value_d1f9 then
-                        State.state_unhookYourself_bfd8 = {}
-                        State.state_unhookYourself_d58e = {}
-                        State.state_unhookYourself_c84b = {}
-                        pcall(function()
-                            local character = LocalPlayer.Character
-                            local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-                            if humanoid then humanoid.AutoRotate = true end
-                        end)
+                    if State.autoParryMenuChanged then return end
+                    if State.SetAutoParryEnabled then
+                        State.SetAutoParryEnabled(var_value_d1f9)
+                    else
+                        State.autoParryEnabled = var_value_d1f9
                     end
-                    -- Keep the mobile button indicator in sync with the menu.
-                    if State.PaintAutoParryButton then pcall(State.PaintAutoParryButton) end
                 end,
             })
-            var_section_4eef.AddToggle(var_section_4eef,{
+            var_section_2baa.AddToggle(var_section_2baa,{
                 -- Mobile-only on-screen toggle. PC users get the keybind below.
                 Title = "Toggle GUI Button", Default = false,
                 Content = "Tombol layar untuk menyalakan Auto Parry (mobile)",
@@ -12566,7 +12740,7 @@ local function BolongHub()
                     if State.RefreshAutoParryButton then pcall(State.RefreshAutoParryButton) end
                 end,
             })
-            var_section_4eef.AddToggle(var_section_4eef,{
+            var_section_2baa.AddToggle(var_section_2baa,{
                 -- Default on, matching main (9).lua where the ring always runs.
                 -- Set back to false if you want it fully opt-in.
                 Title = "Radius ESP", Default = true,
@@ -12588,20 +12762,11 @@ local function BolongHub()
                     State.autoParryRageMode = var_value_d1f9
                 end,
             })
-            var_section_2baa.AddKeybind(var_section_2baa,{
-                -- PC keybind.
-                --
-                -- This UI library stores the bound key internally and fires the
-                -- callback when the key is PRESSED, without passing the key code
-                -- (same shape as "Unhook Keybind" / "GenBoost Keybind" elsewhere in
-                -- this script). So the callback must take no arguments, and it must
-                -- not try to validate an incoming key: an unbound (Unknown) keybind
-                -- never fires at all.
-                Title = "Toggle Keybind (PC)",
-                Default = Enum.KeyCode.Unknown,
+            var_section_2baa.AddButton(var_section_2baa,{
+                Title = "Set Toggle Keybind",
+                Content = "P / supports MMB",
                 Callback = function()
-                    if not State.ToggleAutoParry then return end
-                    pcall(State.ToggleAutoParry)
+                    if State.BeginAutoParryBindCapture then State.BeginAutoParryBindCapture() end
                 end,
             })
             var_section_2baa.AddSlider(var_section_2baa,{
