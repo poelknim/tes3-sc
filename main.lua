@@ -7037,135 +7037,32 @@ local function BolongHub()
             local autoParryBindButton = nil
             local autoParryCapturingBind = false
             local AUTO_PARRY_BIND_ACTION = "BolongHubAutoParryToggle"
-            local lastAutoParryResolverDebug, lastAutoParryResolverDebugAt = nil, 0
-            local autoParryNativeControlWarningShown = false
-
-            local function DebugAutoParryResolver(message)
-                if not State.autoParryDebug then return end
-                local now = tick()
-                if message ~= lastAutoParryResolverDebug or now - lastAutoParryResolverDebugAt > 5 then
-                    lastAutoParryResolverDebug, lastAutoParryResolverDebugAt = message, now
-                    Notify("Auto Parry", message, 2)
-                end
-            end
-
-            local function IsAutoParryControl(control)
-                return control == autoParryButtonImage or control.Name == "AutoParryToggleBtn" or (autoParryButtonGui and control:IsDescendantOf(autoParryButtonGui))
-            end
-
-            local function ResolveNativeParryButton(playerGui)
-                local camera = workspace.CurrentCamera
-                if not (playerGui and camera) then return nil end
-                local viewport = camera.ViewportSize
-                local best, bestScore = nil, -math.huge
+            local function FindSquareSwordSource(playerGui)
+                if not playerGui then return nil end
                 for _, button in ipairs(playerGui:GetDescendants()) do
-                    if button:IsA("ImageButton") and not IsAutoParryControl(button) and button.Visible and button.AbsoluteSize.X > 28 and button.AbsoluteSize.Y > 28 then
-                        local position, size = button.AbsolutePosition, button.AbsoluteSize
-                        local centerX = (position.X + size.X / 2) / math.max(viewport.X, 1)
-                        local centerY = (position.Y + size.Y / 2) / math.max(viewport.Y, 1)
-                        local ratio = size.X / math.max(size.Y, 1)
-                        local name = string.lower(button.Name)
-                        local ancestry = ""
-                        local ancestor = button.Parent
-                        while ancestor do
-                            ancestry = ancestry .. " " .. string.lower(ancestor.Name)
-                            ancestor = ancestor.Parent
+                    if button:IsA("ImageButton") and button.Name == "Gui-mob" and button.Visible then
+                        if button.Image ~= "" then return button end
+                        for _, icon in ipairs(button:GetDescendants()) do
+                            if icon:IsA("ImageLabel") and icon.Image ~= "" then return icon end
                         end
-                        local rejected = string.find(name, "run", 1, true) or string.find(name, "crouch", 1, true) or string.find(name, "toolbar", 1, true) or string.find(name, "item", 1, true) or string.find(name, "slot", 1, true)
-                            or string.find(ancestry, "run", 1, true) or string.find(ancestry, "crouch", 1, true) or string.find(ancestry, "toolbar", 1, true) or string.find(ancestry, "item", 1, true) or string.find(ancestry, "slot", 1, true)
-                        local inTargetRegion = centerX >= 0.58 and centerX <= 0.92 and centerY >= 0.38 and centerY <= 0.76
-                        local squareish = ratio >= 0.78 and ratio <= 1.28
-                        if not rejected and inTargetRegion and squareish then
-                            local distanceSquared = (centerX - 0.75) ^ 2 + (centerY - 0.62) ^ 2
-                            local score = -distanceSquared * 1000
-                            if string.find(name, "attack", 1, true) or string.find(name, "parry", 1, true) or string.find(name, "sword", 1, true) or string.find(name, "dagger", 1, true) then score = score + 100 end
-                            if name == "gui-mob" then score = score + 75 end
-                            if score >= -50 and score > bestScore then best, bestScore = button, score end
-                        end
+                        return nil
                     end
                 end
-                return best
-            end
-
-            local function FindControlButtons(playerGui)
-                local buttons = {}
-                for _, descendant in ipairs(playerGui:GetDescendants()) do
-                    if descendant:IsA("GuiButton") and not IsAutoParryControl(descendant) and descendant.Visible and descendant.AbsoluteSize.X > 0 and descendant.AbsoluteSize.Y > 0 then
-                        table.insert(buttons, descendant)
-                    end
-                end
-                return buttons
-            end
-
-            local function RectanglesOverlap(firstPosition, firstSize, secondPosition, secondSize, padding)
-                return firstPosition.X < secondPosition.X + secondSize.X + padding and firstPosition.X + firstSize > secondPosition.X - padding
-                    and firstPosition.Y < secondPosition.Y + secondSize.Y + padding and firstPosition.Y + firstSize > secondPosition.Y - padding
+                return nil
             end
 
             PositionAutoParryButton = function()
                 if not autoParryButtonImage or not autoParryButtonImage.Parent then return end
-                local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
                 local camera = workspace.CurrentCamera
-                local parry = playerGui and ResolveNativeParryButton(playerGui)
-                if not parry or parry.AbsoluteSize.X <= 0 or parry.AbsoluteSize.Y <= 0 or not camera then
-                    DebugAutoParryResolver("Resolver failed: no credible right-middle parry button")
-                    if State.autoParryMobileButton and not autoParryNativeControlWarningShown then
-                        autoParryNativeControlWarningShown = true
-                        Notify("Auto Parry Button", "native sword control not found", 3)
-                    end
-                    autoParryButtonImage.Visible = false
-                    return
-                end
-                autoParryNativeControlWarningShown = false
+                if not camera then return end
                 local viewport = camera.ViewportSize
-                local size = math.max(52, math.min(parry.AbsoluteSize.X, parry.AbsoluteSize.Y))
-                local gap = 12
-                local parryPosition, parrySize = parry.AbsolutePosition, parry.AbsoluteSize
-                local candidates = {
-                    Vector2.new(parryPosition.X - size - gap, parryPosition.Y + (parrySize.Y - size) / 2),
-                    Vector2.new(parryPosition.X - size - gap, parryPosition.Y - size - gap),
-                    Vector2.new(parryPosition.X + (parrySize.X - size) / 2, parryPosition.Y - size - gap),
-                    Vector2.new(parryPosition.X + parrySize.X + gap, parryPosition.Y - size - gap),
-                }
-                local controls = FindControlButtons(playerGui)
-                local target
-                for _, candidate in ipairs(candidates) do
-                    local inViewport = candidate.X >= 0 and candidate.Y >= 0 and candidate.X + size <= viewport.X and candidate.Y + size <= viewport.Y
-                    local safe = inViewport
-                    if safe then
-                        for _, control in ipairs(controls) do
-                            if RectanglesOverlap(candidate, Vector2.new(size, size), control.AbsolutePosition, control.AbsoluteSize, gap) then
-                                safe = false
-                                break
-                            end
-                        end
-                    end
-                    if safe then
-                        target = candidate
-                        break
-                    end
-                end
-                if not target then
-                    local fallback = Vector2.new(math.clamp(parryPosition.X - size - gap, 0, math.max(0, viewport.X - size)), math.clamp(parryPosition.Y + (parrySize.Y - size) / 2, 0, math.max(0, viewport.Y - size)))
-                    local safe = not RectanglesOverlap(fallback, Vector2.new(size, size), parryPosition, parrySize, 0)
-                    if safe then
-                        for _, control in ipairs(controls) do
-                            if RectanglesOverlap(fallback, Vector2.new(size, size), control.AbsolutePosition, control.AbsoluteSize, gap) then
-                                safe = false
-                                break
-                            end
-                        end
-                    end
-                    if safe then target = fallback end
-                end
-                if not target then
-                    DebugAutoParryResolver("Position failed: " .. parry.Name .. " @ " .. math.floor(parryPosition.X) .. "," .. math.floor(parryPosition.Y))
-                    autoParryButtonImage.Visible = false
-                    return
-                end
+                if viewport.X <= 0 or viewport.Y <= 0 then return end
+                local size = math.clamp(math.min(viewport.X, viewport.Y) * 0.12, 64, 96)
+                local centerX = math.clamp(viewport.X * 0.68, size / 2, viewport.X - size / 2)
+                local centerY = math.clamp(viewport.Y * 0.62, size / 2, viewport.Y - size / 2)
                 autoParryButtonImage.Size = UDim2.fromOffset(size, size)
-                autoParryButtonImage.AnchorPoint = Vector2.zero
-                autoParryButtonImage.Position = UDim2.fromOffset(target.X, target.Y)
+                autoParryButtonImage.AnchorPoint = Vector2.new(0.5, 0.5)
+                autoParryButtonImage.Position = UDim2.fromOffset(centerX, centerY)
                 autoParryButtonImage.Visible = true
             end
 
@@ -7174,9 +7071,8 @@ local function BolongHub()
                 pcall(function()
                     local enabled = State.autoParryEnabled
                     local opacity = enabled and 0 or 0.67
-                    if autoParryButtonImage:IsA("ImageButton") then
-                        autoParryButtonImage.ImageTransparency = opacity
-                    end
+                    local icon = autoParryButtonImage:FindFirstChild("SwordIcon")
+                    if icon and icon:IsA("ImageLabel") then icon.ImageTransparency = opacity end
                     autoParryButtonImage.BackgroundTransparency = opacity
                     local stroke = autoParryButtonImage:FindFirstChild("AutoParryStroke")
                     if stroke and stroke:IsA("UIStroke") then stroke.Transparency = enabled and 0.08 or 0.67 end
@@ -7331,37 +7227,32 @@ local function BolongHub()
             CreateAutoParryButton = function()
                 if autoParryButtonGui then return true end
                 local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
-                local native = playerGui and ResolveNativeParryButton(playerGui)
-                if not native then
-                    DebugAutoParryResolver("Resolver failed: no credible right-middle parry button")
-                    if not autoParryNativeControlWarningShown then
-                        autoParryNativeControlWarningShown = true
-                        Notify("Auto Parry Button", "native sword control not found", 3)
-                    end
-                    return false
-                end
-                autoParryNativeControlWarningShown = false
-                DebugAutoParryResolver("Resolver: " .. native.Name .. " @ " .. math.floor(native.AbsolutePosition.X) .. "," .. math.floor(native.AbsolutePosition.Y))
+                if not playerGui then return false end
+                local source = FindSquareSwordSource(playerGui)
                 local gui = Instance.new("ScreenGui")
-                local nativeGui = native:FindFirstAncestorWhichIsA("ScreenGui")
                 gui.Name, gui.ResetOnSpawn, gui.IgnoreGuiInset = "BolongHubAutoParryToggle", false, true
-                gui.DisplayOrder = math.max(1, (nativeGui and nativeGui.DisplayOrder or 0) + 1)
-                gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+                gui.DisplayOrder, gui.ZIndexBehavior = 100, Enum.ZIndexBehavior.Sibling
                 gui.Parent = playerGui
-                local button = native:Clone()
-                for _, descendant in ipairs(button:GetDescendants()) do
-                    if descendant:IsA("LocalScript") or descendant:IsA("Script") then descendant:Destroy() end
-                end
-                button.Name, button.AutoButtonColor, button.Visible = "AutoParryToggleBtn", false, true
-                button.ZIndex = native.ZIndex + 10
+                local button = Instance.new("ImageButton")
+                button.Name, button.BackgroundColor3, button.BackgroundTransparency = "AutoParryToggleBtn", Color3.fromRGB(42, 45, 50), 0
+                button.AutoButtonColor, button.Visible, button.ZIndex = false, true, 10
                 button.Parent = gui
+                local corner = Instance.new("UICorner")
+                corner.CornerRadius, corner.Parent = UDim.new(1, 0), button
+                local aspect = Instance.new("UIAspectRatioConstraint")
+                aspect.AspectRatio, aspect.Parent = 1, button
+                local icon = Instance.new("ImageLabel")
+                icon.Name, icon.BackgroundTransparency, icon.Size, icon.Position = "SwordIcon", 1, UDim2.fromScale(0.68, 0.68), UDim2.fromScale(0.16, 0.16)
+                icon.ZIndex, icon.ScaleType = 11, Enum.ScaleType.Fit
+                if source then
+                    icon.Image, icon.ImageRectOffset, icon.ImageRectSize = source.Image, source.ImageRectOffset, source.ImageRectSize
+                end
+                icon.Parent = button
                 local stroke = Instance.new("UIStroke")
                 stroke.Name, stroke.Thickness, stroke.ApplyStrokeMode = "AutoParryStroke", 2, Enum.ApplyStrokeMode.Border
-                stroke.Color = Color3.fromRGB(100, 255, 135)
-                stroke.Parent = button
+                stroke.Color, stroke.Parent = Color3.fromRGB(100, 255, 135), button
                 local gradient = Instance.new("UIGradient")
-                gradient.Color = ColorSequence.new(Color3.fromRGB(45, 170, 80), Color3.fromRGB(150, 255, 170))
-                gradient.Rotation = 45
+                gradient.Color, gradient.Rotation = ColorSequence.new(Color3.fromRGB(45, 170, 80), Color3.fromRGB(150, 255, 170)), 45
                 gradient.Parent = stroke
                 button.Activated:Connect(ToggleAutoParry)
                 autoParryButtonGui, autoParryButtonImage = gui, button
@@ -7624,23 +7515,6 @@ local function BolongHub()
                     end
                 end
 
-                if not fired then
-                    pcall(function()
-                        -- Use the same qualified right-side survivor-control resolver
-                        -- as the custom HUD clone. Never fall back to the first
-                        -- Gui-mob, which can be the unrelated purple top-left item.
-                        local mobileButton = ResolveNativeParryButton(PlayerGui)
-                        if mobileButton and mobileButton:IsA("GuiButton") and typeof(firesignal) == "function" then
-                            firesignal(mobileButton.MouseButton1Down)
-                            task.defer(function()
-                                if mobileButton.Parent then
-                                    firesignal(mobileButton.MouseButton1Up)
-                                end
-                            end)
-                            fired = true
-                        end
-                    end)
-                end
 
                 if fired then
                     -- Rage cooldown: 0.5s
